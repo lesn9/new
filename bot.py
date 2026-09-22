@@ -109,12 +109,14 @@ Finds early public-facing projects and stores them while you sleep.
 /newtokens 3d — last 3 days
 /project chain:address — one project
 /research chain:address — same report
+/jobs — projects worth your time (opportunity score)
+/digest 12h — morning shortlist, ranked
 /watchlist — saved projects
-/alerts on — live pings
+/alerts on — live pings (score 45+)
 /alerts off — silence
 /status — scanner health
 
-Alerts only fire when a project has a website or socials.
+Alerts only fire when a project looks public-facing AND scores high enough.
 """
 
 
@@ -357,6 +359,18 @@ class DB:
         )
         row = await cur.fetchone()
         return int(row["n"] if row else 0)
+
+    async def qualified_since(self, since_ts: int) -> list[dict[str, Any]]:
+        cur = await self.c.execute(
+            """
+            SELECT * FROM projects
+            WHERE discovered_at >= ? AND qualified=1
+            ORDER BY discovered_at DESC
+            LIMIT 200
+            """,
+            (since_ts,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
 
     async def stats(self) -> dict[str, int]:
         cur = await self.c.execute(
@@ -628,6 +642,78 @@ def parse_gecko(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 # ---------- reports ----------
 
+def score_project(p: dict[str, Any]) -> dict[str, Any]:
+    """Heuristic score for community / social opportunity — not a trade call."""
+    score = 0
+    roles: list[str] = []
+    age_ts = p.get("launched_at") or p.get("discovered_at")
+    age_h = ((time.time() - age_ts) / 3600) if age_ts else None
+    liq = p.get("liquidity_usd") or 0
+    vol = p.get("volume_24h") or 0
+    desc = str(p.get("description") or "")
+    socials = sum(1 for k in ("website", "twitter", "telegram", "discord", "docs") if p.get(k))
+
+    if p.get("website"):
+        score += 15
+    if p.get("twitter"):
+        score += 12
+    if p.get("telegram"):
+        score += 12
+    if p.get("discord"):
+        score += 8
+    if p.get("docs"):
+        score += 10
+    else:
+        if p.get("telegram") or p.get("discord"):
+            score += 8
+            roles.append("Content / FAQ")
+    if len(desc) > 40:
+        score += 12
+    if age_h is not None:
+        if age_h < 12:
+            score += 14
+        elif age_h < 48:
+            score += 10
+        elif age_h < 168:
+            score += 4
+    if liq >= 25_000:
+        score += 10
+    elif liq >= 8_000:
+        score += 6
+    elif liq and liq < 1500:
+        score -= 8
+    if vol >= 50_000:
+        score += 6
+    if p.get("twitter") and not p.get("telegram"):
+        roles.append("Community setup")
+        score += 6
+    if p.get("telegram") and p.get("twitter"):
+        roles.append("Community / Social")
+    if socials >= 3 and age_h is not None and age_h < 72:
+        roles.append("Early community voice")
+    if not roles and socials >= 2:
+        roles.append("Research then engage")
+
+    score = max(0, min(100, score))
+    if score >= 70:
+        band = "HIGH"
+    elif score >= 45:
+        band = "MEDIUM"
+    else:
+        band = "LOW"
+    action = "Join chat → ask one product question → watch how the team replies"
+    if "Content / FAQ" in roles:
+        action = "Read the chat gaps → draft 3 FAQs in your notes → then join usefully"
+    if "Community setup" in roles:
+        action = "Check X first → see if they need a Telegram/Discord home"
+    return {
+        "score": score,
+        "band": band,
+        "roles": roles[:3] or ["Watch only"],
+        "action": action,
+    }
+
+
 def opportunity_signals(p: dict[str, Any]) -> list[str]:
     signals: list[str] = []
     age_ts = p.get("launched_at") or p.get("discovered_at")
@@ -670,12 +756,14 @@ def observations_for(p: dict[str, Any]) -> list[str]:
 
 
 def list_item(index: int, p: dict[str, Any]) -> str:
+    s = score_project(p)
     return (
-        f"<b>{index}.</b> {esc(title_of(p))}\n"
+        f"<b>{index}.</b> {esc(title_of(p))} · {s['band']} {s['score']}\n"
         f"⛓ {esc((p.get('chain') or '?').title())} · 🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}\n"
         f"💧 {esc(money(p.get('liquidity_usd')))} · 📊 {esc(money(p.get('volume_24h')))}\n"
         f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
-        f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}"
+        f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}\n"
+        f"💼 {esc(', '.join(s['roles']))}"
     )
 
 
@@ -694,11 +782,13 @@ def list_keyboard(projects: list[dict[str, Any]], since_ts: int, offset: int, to
 
 def report_text(p: dict[str, Any]) -> str:
     what = p.get("description") or "No public description indexed yet."
+    s = score_project(p)
     lines = [
         "🧠 <b>PROJECT INTELLIGENCE</b>",
         f"<b>{esc(title_of(p))}</b>",
         f"⛓ {(p.get('chain') or '?').title()}",
         f"🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}",
+        f"🎯 Opportunity: <b>{s['band']}</b> {s['score']}/100",
         f"🏷 CA: <code>{esc(p.get('token_address') or '')}</code>",
         "",
         "🎯 <b>WHAT THEY BUILD</b>",
@@ -721,9 +811,10 @@ def report_text(p: dict[str, Any]) -> str:
     ]
     for item in observations_for(p):
         lines.append(f"• {esc(item)}")
-    lines += ["", "💼 <b>POTENTIAL OPPORTUNITY</b>"]
+    lines += ["", "💼 <b>POTENTIAL OPPORTUNITY</b>", f"Roles: {esc(', '.join(s['roles']))}"]
     for item in opportunity_signals(p):
         lines.append(f"• {esc(item)}")
+    lines += ["", "👉 <b>NEXT MOVE</b>", esc(s["action"])]
     return "\n".join(lines)
 
 
@@ -754,9 +845,11 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 def alert_text(p: dict[str, Any]) -> str:
+    s = score_project(p)
     return (
         "🚨 <b>NEW PROJECT DETECTED</b>\n"
         f"🪙 {esc(title_of(p))}\n"
+        f"🎯 {s['band']} {s['score']}/100 · {esc(', '.join(s['roles']))}\n"
         f"⛓ {esc((p.get('chain') or '?').title())}\n"
         f"🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}\n"
         f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
@@ -1021,6 +1114,58 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def ranked_window(db: DB, since_ts: int, min_score: int = 45) -> list[dict[str, Any]]:
+    rows = await db.qualified_since(since_ts)
+    ranked = []
+    for p in rows:
+        s = score_project(p)
+        if s["score"] >= min_score:
+            ranked.append((s["score"], p))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [p for _, p in ranked]
+
+
+async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    db, _ = deps(context)
+    arg = context.args[0] if context.args else "24h"
+    since_ts, label = parse_lookback(arg, now() - 24 * 3600)
+    rows = await ranked_window(db, since_ts, min_score=45)
+    top = rows[:8]
+    if not top:
+        await update.effective_message.reply_text("No medium/high opportunities in that window yet.")
+        return
+    header = f"💼 <b>OPPORTUNITY SHORTLIST</b>\nWindow: {esc(label)} · {len(rows)} scored 45+\n"
+    text = header + "\n" + "\n\n".join(list_item(i + 1, p) for i, p in enumerate(top))
+    markup = list_keyboard(top, since_ts, 0, len(top))
+    await update.effective_message.reply_html(text, disable_web_page_preview=True, reply_markup=markup)
+
+
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    db, _ = deps(context)
+    arg = context.args[0] if context.args else "12h"
+    since_ts, label = parse_lookback(arg, now() - 12 * 3600)
+    rows = await ranked_window(db, since_ts, min_score=40)
+    top = rows[:5]
+    if not top:
+        await update.effective_message.reply_text("Digest is empty for that window.")
+        return
+    lines = [f"☀️ <b>DIGEST</b> · {esc(label)}", "Pick 2. Ignore the rest today.", ""]
+    for i, p in enumerate(top, 1):
+        s = score_project(p)
+        lines.append(
+            f"{i}. <b>{esc(title_of(p))}</b> · {s['score']}\n"
+            f"{esc((p.get('chain') or '').title())} · {esc(', '.join(s['roles']))}\n"
+            f"{esc(s['action'])}"
+        )
+        lines.append("")
+    markup = list_keyboard(top, since_ts, 0, len(top))
+    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True, reply_markup=markup)
+
+
 # ---------- background loops ----------
 
 async def discovery_once(app: Application) -> None:
@@ -1088,6 +1233,9 @@ async def send_alerts(app: Application) -> None:
         if not user.get("alerts_enabled", 1):
             continue
         for project in await db.alert_candidates(user_id):
+            if score_project(project)["score"] < 45:
+                await db.mark_alerted(user_id, project["id"])
+                continue
             try:
                 await app.bot.send_message(
                     chat_id=user_id,
@@ -1157,6 +1305,8 @@ def main() -> None:
     app.add_handler(CommandHandler("unwatch", cmd_unwatch))
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("jobs", cmd_jobs))
+    app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(cb_newtokens, pattern=r"^nt:"))
     app.add_handler(CallbackQueryHandler(cb_investigate, pattern=r"^inv:"))
