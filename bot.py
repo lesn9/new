@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -111,6 +112,7 @@ Finds early public-facing projects and stores them while you sleep.
 /research chain:address — same report
 /jobs — projects worth your time (opportunity score)
 /digest 12h — morning shortlist, ranked
+/approach — how to walk into that community
 /watchlist — saved projects
 /alerts on — live pings (score 45+)
 /alerts off — silence
@@ -230,6 +232,14 @@ class DB:
         self.conn.row_factory = aiosqlite.Row
         await self.conn.executescript(SCHEMA)
         await self.conn.commit()
+        await self._migrate()
+
+    async def _migrate(self) -> None:
+        cur = await self.c.execute("PRAGMA table_info(projects)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "community_json" not in cols:
+            await self.c.execute("ALTER TABLE projects ADD COLUMN community_json TEXT")
+            await self.c.commit()
 
     async def close(self) -> None:
         if self.conn:
@@ -468,6 +478,13 @@ class DB:
         )
         return [dict(r) for r in await cur.fetchall()]
 
+    async def save_community(self, pid: int, payload: dict[str, Any]) -> None:
+        await self.c.execute(
+            "UPDATE projects SET community_json=? WHERE id=?",
+            (json.dumps(payload), pid),
+        )
+        await self.c.commit()
+
     async def mark_alerted(self, user_id: int, pid: int) -> None:
         await self.c.execute(
             "INSERT OR IGNORE INTO alerts_sent(user_id, project_id, sent_at) VALUES(?,?,?)",
@@ -640,6 +657,144 @@ def parse_gecko(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def community(p: dict[str, Any]) -> dict[str, Any]:
+    raw = p.get("community_json")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def tg_username(url: str | None) -> str | None:
+    if not url:
+        return None
+    low = url.lower()
+    if "joinchat" in low or "/+" in url:
+        return None
+    match = re.search(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)", url, re.I)
+    if not match:
+        return None
+    name = match.group(1)
+    if name.lower() in {"share", "socks", "proxy", "addstickers", "iv"}:
+        return None
+    return name
+
+
+def discord_invite(url: str | None) -> str | None:
+    if not url:
+        return None
+    match = re.search(r"(?:discord\.gg|discord\.com/invite)/([A-Za-z0-9-]+)", url, re.I)
+    return match.group(1) if match else None
+
+
+def x_handle(url: str | None) -> str | None:
+    if not url:
+        return None
+    match = re.search(r"(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)", url, re.I)
+    if not match:
+        return None
+    name = match.group(1)
+    if name.lower() in {"intent", "share", "i", "home", "search"}:
+        return None
+    return name
+
+
+def extract_meta(html_text: str) -> tuple[str | None, str | None]:
+    title = None
+    desc = None
+    m = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
+    if m:
+        title = re.sub(r"\s+", " ", m.group(1)).strip()[:160]
+    m = re.search(
+        r'<meta[^>]+(?:name|property)=["\'](?:description|og:description)["\'][^>]+content=["\'](.*?)["\']',
+        html_text,
+        re.I | re.S,
+    )
+    if not m:
+        m = re.search(
+            r'<meta[^>]+content=["\'](.*?)["\'][^>]+(?:name|property)=["\'](?:description|og:description)["\']',
+            html_text,
+            re.I | re.S,
+        )
+    if m:
+        desc = re.sub(r"\s+", " ", html.unescape(m.group(1))).strip()[:280]
+    return title, desc
+
+
+async def fetch_website_meta(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
+    if not url or not url.startswith("http"):
+        return {}
+    try:
+        resp = await client.get(url, timeout=12, follow_redirects=True)
+        if resp.status_code >= 400 or not resp.text:
+            return {}
+        title, desc = extract_meta(resp.text[:80_000])
+        out: dict[str, Any] = {}
+        if title:
+            out["site_title"] = title
+        if desc:
+            out["site_about"] = desc
+        return out
+    except Exception as exc:
+        log.warning("website meta failed %s: %s", url, exc)
+        return {}
+
+
+async def fetch_discord(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
+    code = discord_invite(url)
+    if not code:
+        return {}
+    data = await http_get(client, f"https://discord.com/api/v9/invites/{code}", params={"with_counts": "true"})
+    if not isinstance(data, dict) or not data.get("guild"):
+        return {}
+    guild = data.get("guild") or {}
+    return {
+        "dc_name": guild.get("name"),
+        "dc_members": data.get("approximate_member_count"),
+        "dc_online": data.get("approximate_presence_count"),
+    }
+
+
+async def fetch_telegram(bot, url: str) -> dict[str, Any]:
+    username = tg_username(url)
+    if not username or bot is None:
+        return {}
+    try:
+        chat = await bot.get_chat(f"@{username}")
+        members = None
+        try:
+            members = await bot.get_chat_member_count(chat.id)
+        except Exception:
+            members = None
+        return {
+            "tg_title": getattr(chat, "title", None) or getattr(chat, "full_name", None),
+            "tg_about": getattr(chat, "description", None) or getattr(chat, "bio", None),
+            "tg_members": members,
+            "tg_type": getattr(chat, "type", None),
+        }
+    except Exception as exc:
+        log.warning("telegram chat lookup failed @%s: %s", username, exc)
+        return {}
+
+
+async def enrich_community(bot, client: httpx.AsyncClient, project: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(community(project))
+    site = await fetch_website_meta(client, project.get("website") or "")
+    payload.update(site)
+    dc = await fetch_discord(client, project.get("discord") or "")
+    payload.update(dc)
+    tg = await fetch_telegram(bot, project.get("telegram") or "")
+    payload.update(tg)
+    handle = x_handle(project.get("twitter"))
+    if handle:
+        payload["x_handle"] = handle
+    return payload
+
+
 # ---------- reports ----------
 
 def score_project(p: dict[str, Any]) -> dict[str, Any]:
@@ -661,6 +816,22 @@ def score_project(p: dict[str, Any]) -> dict[str, Any]:
         score += 12
     if p.get("discord"):
         score += 8
+    comm = community(p)
+    members = comm.get("tg_members") or comm.get("dc_members") or 0
+    try:
+        members = int(members or 0)
+    except (TypeError, ValueError):
+        members = 0
+    if members >= 5000:
+        score += 8
+    elif members >= 800:
+        score += 12
+        if "Community / Social" not in roles:
+            roles.append("Community / Social")
+    elif members >= 150:
+        score += 8
+    if comm.get("site_about") and not desc:
+        score += 6
     if p.get("docs"):
         score += 10
     else:
@@ -801,6 +972,32 @@ def report_text(p: dict[str, Any]) -> str:
         f"Discord: {esc(p.get('discord') or '—')}",
         f"Docs: {esc(p.get('docs') or '—')}",
         "",
+        "👥 <b>COMMUNITY</b>",
+    ]
+    comm = community(p)
+    if comm.get("tg_title") or comm.get("tg_members"):
+        lines.append(
+            f"TG: {esc(comm.get('tg_title') or 'public chat')} · "
+            f"{esc(comm.get('tg_members') or '—')} members"
+        )
+        if comm.get("tg_about"):
+            lines.append(esc(comm["tg_about"])[:220])
+    if comm.get("dc_name") or comm.get("dc_members"):
+        lines.append(
+            f"Discord: {esc(comm.get('dc_name') or 'server')} · "
+            f"{esc(comm.get('dc_members') or '—')} members"
+            + (f" · {esc(comm.get('dc_online'))} online" if comm.get("dc_online") else "")
+        )
+    if comm.get("site_title"):
+        lines.append(f"Site: {esc(comm.get('site_title'))}")
+    if comm.get("site_about"):
+        lines.append(esc(comm["site_about"])[:220])
+    if comm.get("x_handle"):
+        lines.append(f"X: @{esc(comm['x_handle'])}")
+    if not any(comm.get(k) for k in ("tg_members", "dc_members", "site_title", "tg_title")):
+        lines.append("No public community stats yet. Refresh after Investigate.")
+    lines += [
+        "",
         "📊 <b>MARKET</b>",
         f"Liquidity: {esc(money(p.get('liquidity_usd')))}",
         f"Volume 24h: {esc(money(p.get('volume_24h')))}",
@@ -823,6 +1020,8 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [[
         InlineKeyboardButton("⭐ Watch", callback_data=f"w:{pid}"),
         InlineKeyboardButton("🔄 Refresh", callback_data=f"inv:{pid}"),
+    ], [
+        InlineKeyboardButton("🎯 Approach brief", callback_data=f"ap:{pid}"),
     ]]
     links: list[InlineKeyboardButton] = []
     if p.get("website"):
@@ -842,6 +1041,35 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
     if chain and addr:
         rows.append([InlineKeyboardButton("DexScreener", url=f"https://dexscreener.com/{chain}/{addr}")])
     return InlineKeyboardMarkup(rows)
+
+
+def approach_text(p: dict[str, Any]) -> str:
+    s = score_project(p)
+    comm = community(p)
+    what = p.get("description") or comm.get("site_about") or comm.get("tg_about") or "Thin public description."
+    chat = p.get("telegram") or p.get("discord") or p.get("twitter") or "No public chat indexed"
+    members = comm.get("tg_members") or comm.get("dc_members") or "unknown"
+    return "\n".join([
+        "🎯 <b>APPROACH BRIEF</b>",
+        f"<b>{esc(title_of(p))}</b> · {s['band']} {s['score']}/100",
+        f"⛓ {esc((p.get('chain') or '?').title())} · 👥 {esc(members)}",
+        "",
+        "📌 <b>What they appear to be</b>",
+        esc(what)[:400],
+        "",
+        "💼 <b>Why you might be useful</b>",
+        f"Roles: {esc(', '.join(s['roles']))}",
+        * [f"• {esc(item)}" for item in opportunity_signals(p)[:3]],
+        "",
+        "🗣️ <b>Do not open with GM bullish</b>",
+        "Walk in having read the site. Ask one specific question:",
+        "• How does the live product actually get used today?",
+        "• Which part of the docs is still confusing for new holders?",
+        "• Who is handling community questions right now?",
+        "",
+        f"Door: {esc(chat)}",
+        esc(s["action"]),
+    ])
 
 
 def alert_text(p: dict[str, Any]) -> str:
@@ -894,23 +1122,31 @@ async def claim_owner_if_needed(context: ContextTypes.DEFAULT_TYPE, user_id: int
     log.info("Owner locked to Telegram user %s", user_id)
 
 
-async def enrich_one(db: DB, client: httpx.AsyncClient, project: dict[str, Any]) -> dict[str, Any]:
+async def enrich_one(db: DB, client: httpx.AsyncClient, project: dict[str, Any], bot=None) -> dict[str, Any]:
     chain, addr = project["chain"], project["token_address"]
     data = await http_get(client, f"{DEX_API}/token-pairs/v1/{chain}/{addr}")
     pairs = data if isinstance(data, list) else []
-    if not pairs:
+    if pairs:
+        best = max(pairs, key=lambda p: float(((p.get("liquidity") or {}) or {}).get("usd") or 0))
+        extra = pair_to_project(best)
+        extra["chain"] = chain
+        extra["token_address"] = addr
+        extra["last_enriched_at"] = now()
+        await db.upsert(extra)
+    else:
         await db.mark_enriched(project["id"])
-        return project
-    best = max(pairs, key=lambda p: float(((p.get("liquidity") or {}) or {}).get("usd") or 0))
-    extra = pair_to_project(best)
-    extra["chain"] = chain
-    extra["token_address"] = addr
-    extra["last_enriched_at"] = now()
-    await db.upsert(extra)
-    return await db.by_id(project["id"]) or project
+    fresh = await db.by_id(project["id"]) or project
+    try:
+        payload = await enrich_community(bot, client, fresh)
+        if payload:
+            await db.save_community(fresh["id"], payload)
+            fresh = await db.by_id(fresh["id"]) or fresh
+    except Exception:
+        log.exception("community enrich failed for %s", fresh.get("id"))
+    return fresh
 
 
-async def resolve_project(db: DB, client: httpx.AsyncClient, query: str) -> dict[str, Any] | None:
+async def resolve_project(db: DB, client: httpx.AsyncClient, query: str, bot=None) -> dict[str, Any] | None:
     query = query.strip()
     chain = None
     addr = query
@@ -920,14 +1156,14 @@ async def resolve_project(db: DB, client: httpx.AsyncClient, query: str) -> dict
     if chain:
         found = await db.by_token(chain, addr)
         if found:
-            return await enrich_one(db, client, found)
+            return await enrich_one(db, client, found, bot)
         data = await http_get(client, f"{DEX_API}/tokens/v1/{chain}/{addr}")
         pairs = data if isinstance(data, list) else []
         if pairs:
             proj = pair_to_project(pairs[0])
             pid, _ = await db.upsert(proj)
             row = await db.by_id(pid)
-            return row
+            return await enrich_one(db, client, row, bot) if row else None
     data = await http_get(client, f"{DEX_API}/latest/dex/search", params={"q": query})
     pairs = (data or {}).get("pairs") if isinstance(data, dict) else []
     if not pairs:
@@ -936,7 +1172,8 @@ async def resolve_project(db: DB, client: httpx.AsyncClient, query: str) -> dict
     if not proj.get("token_address"):
         return None
     pid, _ = await db.upsert(proj)
-    return await db.by_id(pid)
+    row = await db.by_id(pid)
+    return await enrich_one(db, client, row, bot) if row else None
 
 
 # ---------- handlers ----------
@@ -1014,7 +1251,7 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.effective_message.reply_text("Usage: /project solana:Address")
         return
     db, client = deps(context)
-    project = await resolve_project(db, client, query)
+    project = await resolve_project(db, client, query, context.bot)
     if not project:
         await update.effective_message.reply_text("Could not find that project. Try chain:address.")
         return
@@ -1033,7 +1270,7 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not project:
         await update.callback_query.edit_message_text("Project no longer in the database.")
         return
-    project = await enrich_one(db, client, project)
+    project = await enrich_one(db, client, project, context.bot)
     await update.callback_query.edit_message_text(
         report_text(project),
         parse_mode="HTML",
@@ -1123,6 +1360,42 @@ async def ranked_window(db: DB, since_ts: int, min_score: int = 45) -> list[dict
             ranked.append((s["score"], p))
     ranked.sort(key=lambda item: item[0], reverse=True)
     return [p for _, p in ranked]
+
+
+async def cmd_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /approach <project_id>   or tap Approach brief on a report.")
+        return
+    db, client = deps(context)
+    project = await db.by_id(int(context.args[0]))
+    if not project:
+        await update.effective_message.reply_text("Unknown project id. Use /jobs first.")
+        return
+    project = await enrich_one(db, client, project, context.bot)
+    await update.effective_message.reply_html(
+        approach_text(project), disable_web_page_preview=True, reply_markup=report_keyboard(project)
+    )
+
+
+async def cb_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
+        return
+    await update.callback_query.answer("Building brief…")
+    pid = int(update.callback_query.data.split(":")[1])
+    db, client = deps(context)
+    project = await db.by_id(pid)
+    if not project:
+        await update.callback_query.edit_message_text("Project no longer in the database.")
+        return
+    project = await enrich_one(db, client, project, context.bot)
+    await update.callback_query.edit_message_text(
+        approach_text(project),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=report_keyboard(project),
+    )
 
 
 async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1307,9 +1580,11 @@ def main() -> None:
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("approach", cmd_approach))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(cb_newtokens, pattern=r"^nt:"))
     app.add_handler(CallbackQueryHandler(cb_investigate, pattern=r"^inv:"))
+    app.add_handler(CallbackQueryHandler(cb_approach, pattern=r"^ap:"))
     app.add_handler(CallbackQueryHandler(cb_watch, pattern=r"^w:"))
     log.info("Polling Telegram…")
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
