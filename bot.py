@@ -16,7 +16,13 @@ import aiosqlite
 import httpx
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    TypeHandler,
+)
 
 load_dotenv()
 logging.basicConfig(
@@ -44,7 +50,7 @@ GECKO_CHAIN = {
 }
 
 DEFAULT_CHAINS = {
-    "solana", "base", "bsc", "ethereum", "abstract", "robinhood",
+    "solana", "base", "ethereum", "abstract", "robinhood", "arc",
     "hyperevm", "sui", "arbitrum", "ink", "monad",
 }
 
@@ -108,17 +114,19 @@ Finds early public-facing projects and stores them while you sleep.
 /newtokens 6h — last 6 hours
 /newtokens 24h — last 24 hours
 /newtokens 3d — last 3 days
-/project chain:address — one project
-/research chain:address — same report
-/jobs — projects worth your time (opportunity score)
-/digest 12h — morning shortlist, ranked
-/approach — how to walk into that community
-/watchlist — saved projects
-/alerts on — live pings (score 45+)
-/alerts off — silence
-/status — scanner health
+/project &lt;CA or chain:CA&gt; — investigate any contract you found
+/research &lt;same&gt;
+/jobs — scored shortlist
+/digest 12h — morning 5
+/approach &lt;id&gt; — tailored comments (X and/or Telegram)
+/early — pre-token / social-first projects
+/watchlist
+/alerts on|off
+/status
 
-Alerts only fire when a project looks public-facing AND scores high enough.
+Alerts:
+🚨 new public project
+📡 socials appeared later (X/TG showed up after first seen)
 """
 
 
@@ -226,6 +234,7 @@ class DB:
     def __init__(self, path: str):
         self.path = path
         self.conn: aiosqlite.Connection | None = None
+        self.lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self.conn = await aiosqlite.connect(self.path)
@@ -239,7 +248,19 @@ class DB:
         cols = {row[1] for row in await cur.fetchall()}
         if "community_json" not in cols:
             await self.c.execute("ALTER TABLE projects ADD COLUMN community_json TEXT")
-            await self.c.commit()
+        await self.c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS social_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                url TEXT,
+                seen_at INTEGER NOT NULL,
+                alerted INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await self.c.commit()
 
     async def close(self) -> None:
         if self.conn:
@@ -312,6 +333,9 @@ class DB:
                 ),
             )
             await self.c.commit()
+            if not old.get("qualified") and merged.get("qualified"):
+                await self.set_meta("last_qualified_at", str(now()))
+            await self._record_new_socials(int(old["id"]), old, merged)
             return int(old["id"]), False
         data.setdefault("discovered_at", now())
         cur = await self.c.execute(
@@ -335,7 +359,10 @@ class DB:
             ),
         )
         await self.c.commit()
-        return int(cur.lastrowid), True
+        pid = int(cur.lastrowid)
+        if data.get("qualified"):
+            await self.set_meta("last_qualified_at", str(now()))
+        return pid, True
 
     async def by_id(self, pid: int) -> dict[str, Any] | None:
         cur = await self.c.execute("SELECT * FROM projects WHERE id=?", (pid,))
@@ -478,11 +505,72 @@ class DB:
         )
         return [dict(r) for r in await cur.fetchall()]
 
+    async def _record_new_socials(self, pid: int, old: dict[str, Any], new: dict[str, Any]) -> None:
+        mapping = (("website", "website"), ("twitter", "x"), ("telegram", "telegram"), ("discord", "discord"))
+        for field, kind in mapping:
+            if new.get(field) and not old.get(field):
+                await self.c.execute(
+                    "INSERT INTO social_events(project_id, kind, url, seen_at, alerted) VALUES(?,?,?,?,0)",
+                    (pid, kind, new.get(field), now()),
+                )
+        await self.c.commit()
+
+    async def pending_social_events(self, limit: int = 8) -> list[dict[str, Any]]:
+        cur = await self.c.execute(
+            """
+            SELECT e.*, p.name, p.symbol, p.chain, p.token_address, p.website, p.twitter,
+                   p.telegram, p.discord, p.docs, p.discovered_at, p.launched_at,
+                   p.liquidity_usd, p.volume_24h, p.description, p.id AS project_pk
+            FROM social_events e
+            JOIN projects p ON p.id = e.project_id
+            WHERE e.alerted=0 AND e.kind IN ('x','telegram','website')
+            ORDER BY e.seen_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def mark_social_alerted(self, event_id: int) -> None:
+        await self.c.execute("UPDATE social_events SET alerted=1 WHERE id=?", (event_id,))
+        await self.c.commit()
+
     async def save_community(self, pid: int, payload: dict[str, Any]) -> None:
         await self.c.execute(
             "UPDATE projects SET community_json=? WHERE id=?",
             (json.dumps(payload), pid),
         )
+        patch: dict[str, Any] = {}
+        if payload.get("found_website"):
+            patch["website"] = payload["found_website"]
+        if payload.get("found_twitter"):
+            patch["twitter"] = payload["found_twitter"]
+        if payload.get("found_telegram"):
+            patch["telegram"] = payload["found_telegram"]
+        if payload.get("found_discord"):
+            patch["discord"] = payload["found_discord"]
+        if payload.get("found_docs"):
+            patch["docs"] = payload["found_docs"]
+        if patch:
+            cur = await self.c.execute("SELECT * FROM projects WHERE id=?", (pid,))
+            old = await cur.fetchone()
+            if old:
+                old_d = dict(old)
+                sets = []
+                args: list[Any] = []
+                for k, v in patch.items():
+                    if not old_d.get(k) and v:
+                        sets.append(f"{k}=?")
+                        args.append(v)
+                if sets:
+                    args.append(pid)
+                    await self.c.execute(f"UPDATE projects SET {', '.join(sets)} WHERE id=?", args)
+                    fresh = dict(old_d)
+                    fresh.update(patch)
+                    if is_qualified(fresh) and not old_d.get("qualified"):
+                        await self.c.execute("UPDATE projects SET qualified=1 WHERE id=?", (pid,))
+                        await self.set_meta("last_qualified_at", str(now()))
+                    await self._record_new_socials(pid, old_d, fresh)
         await self.c.commit()
 
     async def mark_alerted(self, user_id: int, pid: int) -> None:
@@ -725,6 +813,24 @@ def extract_meta(html_text: str) -> tuple[str | None, str | None]:
     return title, desc
 
 
+def links_from_html(html_text: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for url in re.findall(r"https?://[^\s\"'<>]+", html_text, re.I):
+        clean = url.rstrip(").,]")
+        low = clean.lower()
+        if ("t.me/" in low or "telegram.me/" in low) and "found_telegram" not in found:
+            if "share" not in low and "socks" not in low:
+                found["found_telegram"] = clean
+        elif ("x.com/" in low or "twitter.com/" in low) and "found_twitter" not in found:
+            if not any(x in low for x in ("/intent", "/share", "/home", "/search")):
+                found["found_twitter"] = clean
+        elif ("discord.gg/" in low or "discord.com/invite/" in low) and "found_discord" not in found:
+            found["found_discord"] = clean
+        elif ("gitbook" in low or "/docs" in low) and "found_docs" not in found:
+            found["found_docs"] = clean
+    return found
+
+
 async def fetch_website_meta(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
     if not url or not url.startswith("http"):
         return {}
@@ -732,12 +838,14 @@ async def fetch_website_meta(client: httpx.AsyncClient, url: str) -> dict[str, A
         resp = await client.get(url, timeout=12, follow_redirects=True)
         if resp.status_code >= 400 or not resp.text:
             return {}
-        title, desc = extract_meta(resp.text[:80_000])
+        blob = resp.text[:80_000]
+        title, desc = extract_meta(blob)
         out: dict[str, Any] = {}
         if title:
             out["site_title"] = title
         if desc:
             out["site_about"] = desc
+        out.update(links_from_html(blob))
         return out
     except Exception as exc:
         log.warning("website meta failed %s: %s", url, exc)
@@ -781,17 +889,184 @@ async def fetch_telegram(bot, url: str) -> dict[str, Any]:
         return {}
 
 
+async def fetch_x_tweets(client: httpx.AsyncClient, handle: str) -> list[dict[str, Any]]:
+    token = os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN") or ""
+    if not token or not handle:
+        return []
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        user = await client.get(
+            f"https://api.x.com/2/users/by/username/{handle}",
+            headers=headers,
+            timeout=15,
+        )
+        if user.status_code >= 400:
+            return []
+        uid = (user.json().get("data") or {}).get("id")
+        if not uid:
+            return []
+        tw = await client.get(
+            f"https://api.x.com/2/users/{uid}/tweets",
+            headers=headers,
+            params={"max_results": 5, "tweet.fields": "created_at,text"},
+            timeout=15,
+        )
+        if tw.status_code >= 400:
+            return []
+        return [
+            {"id": t.get("id"), "text": t.get("text"), "created_at": t.get("created_at")}
+            for t in (tw.json().get("data") or [])
+        ]
+    except Exception as exc:
+        log.warning("X tweets failed @%s: %s", handle, exc)
+        return []
+
+
+async def search_early_x(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    token = os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN") or ""
+    if not token:
+        return []
+    query = (
+        '("we just launched" OR "testnet is live" OR "join our telegram" OR "docs are live" '
+        'OR "building in public") (web3 OR crypto OR L2 OR "ai agent") -is:retweet -is:reply lang:en'
+    )
+    try:
+        resp = await client.get(
+            "https://api.x.com/2/tweets/search/recent",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "query": query,
+                "max_results": 10,
+                "tweet.fields": "created_at,author_id,text",
+                "expansions": "author_id",
+                "user.fields": "username,name,description",
+            },
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            log.warning("X early search %s: %s", resp.status_code, resp.text[:200])
+            return []
+        data = resp.json()
+        users = {u["id"]: u for u in (data.get("includes") or {}).get("users") or []}
+        out = []
+        for t in data.get("data") or []:
+            u = users.get(t.get("author_id") or "") or {}
+            out.append({
+                "tweet_id": t.get("id"),
+                "text": t.get("text"),
+                "created_at": t.get("created_at"),
+                "username": u.get("username"),
+                "name": u.get("name"),
+                "bio": u.get("description"),
+            })
+        return out
+    except Exception as exc:
+        log.warning("X early search failed: %s", exc)
+        return []
+
+
+async def llm_write(prompt: str) -> str | None:
+    gemini = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+    xai = os.getenv("XAI_API_KEY") or ""
+    oai = os.getenv("OPENAI_API_KEY") or ""
+    system = (
+        "You write short, human crypto community comments. "
+        "No GM bullish. No investment advice. No fake claims. "
+        "Sound like a real person who actually read the project."
+    )
+    if gemini:
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+                resp = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    headers={"x-goog-api-key": gemini, "Content-Type": "application/json"},
+                    json={
+                        "system_instruction": {"parts": [{"text": system}]},
+                        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 900},
+                    },
+                )
+            if resp.status_code >= 400:
+                log.warning("Gemini %s: %s", resp.status_code, resp.text[:240])
+                return None
+            parts = (((resp.json().get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
+            text = "".join(p.get("text") or "" for p in parts).strip()
+            return text or None
+        except Exception as exc:
+            log.warning("Gemini failed: %s", exc)
+            return None
+    if xai:
+        url, key, model = "https://api.x.ai/v1/chat/completions", xai, os.getenv("XAI_MODEL", "grok-4-1-fast")
+    elif oai:
+        url, key, model = "https://api.openai.com/v1/chat/completions", oai, "gpt-4o-mini"
+    else:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "temperature": 0.7,
+                    "max_tokens": 900,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You write short, human crypto community comments. "
+                                "No GM bullish. No investment advice. No fake claims. "
+                                "Sound like a real person who actually read the project."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+            )
+        if resp.status_code >= 400:
+            log.warning("LLM %s: %s", resp.status_code, resp.text[:240])
+            return None
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        log.warning("LLM failed: %s", exc)
+        return None
+
+
+async def guess_telegram(bot, project: dict[str, Any]) -> dict[str, Any]:
+    if project.get("telegram") or bot is None:
+        return {}
+    guesses: list[str] = []
+    name = re.sub(r"[^A-Za-z0-9]", "", str(project.get("name") or ""))
+    symbol = re.sub(r"[^A-Za-z0-9]", "", str(project.get("symbol") or ""))
+    for raw in (symbol, name, f"{name}portal", f"{symbol}portal", f"{name}chat"):
+        if raw and len(raw) >= 4:
+            guesses.append(raw)
+    for handle in guesses[:5]:
+        info = await fetch_telegram(bot, f"https://t.me/{handle}")
+        if info.get("tg_title"):
+            info["found_telegram"] = f"https://t.me/{handle}"
+            return info
+    return {}
+
+
 async def enrich_community(bot, client: httpx.AsyncClient, project: dict[str, Any]) -> dict[str, Any]:
     payload = dict(community(project))
     site = await fetch_website_meta(client, project.get("website") or "")
     payload.update(site)
-    dc = await fetch_discord(client, project.get("discord") or "")
+    dc = await fetch_discord(client, project.get("discord") or payload.get("found_discord") or "")
     payload.update(dc)
-    tg = await fetch_telegram(bot, project.get("telegram") or "")
+    tg_url = project.get("telegram") or payload.get("found_telegram")
+    tg = await fetch_telegram(bot, tg_url or "")
     payload.update(tg)
-    handle = x_handle(project.get("twitter"))
+    if not tg_url:
+        payload.update(await guess_telegram(bot, project))
+    handle = x_handle(project.get("twitter") or payload.get("found_twitter"))
     if handle:
         payload["x_handle"] = handle
+        tweets = await fetch_x_tweets(client, handle)
+        if tweets:
+            payload["x_tweets"] = tweets[:5]
     return payload
 
 
@@ -961,6 +1236,7 @@ def report_text(p: dict[str, Any]) -> str:
         f"🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}",
         f"🎯 Opportunity: <b>{s['band']}</b> {s['score']}/100",
         f"🏷 CA: <code>{esc(p.get('token_address') or '')}</code>",
+        f"🕒 First stored: {esc(ago(p.get('discovered_at')))}",
         "",
         "🎯 <b>WHAT THEY BUILD</b>",
         esc(what)[:700],
@@ -1022,6 +1298,7 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🔄 Refresh", callback_data=f"inv:{pid}"),
     ], [
         InlineKeyboardButton("🎯 Approach brief", callback_data=f"ap:{pid}"),
+        InlineKeyboardButton("🔀 Shuffle", callback_data=f"ap:{pid}"),
     ]]
     links: list[InlineKeyboardButton] = []
     if p.get("website"):
@@ -1043,33 +1320,74 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def approach_text(p: dict[str, Any]) -> str:
+async def approach_text(p: dict[str, Any]) -> str:
     s = score_project(p)
     comm = community(p)
     what = p.get("description") or comm.get("site_about") or comm.get("tg_about") or "Thin public description."
-    chat = p.get("telegram") or p.get("discord") or p.get("twitter") or "No public chat indexed"
-    members = comm.get("tg_members") or comm.get("dc_members") or "unknown"
-    return "\n".join([
+    tweets = comm.get("x_tweets") or []
+    tweet_blob = "\n".join(f"- {(t.get('text') or '')[:180]}" for t in tweets[:4]) or "No recent tweets indexed."
+    has_tg = bool(p.get("telegram"))
+    has_x = bool(p.get("twitter"))
+    door = "X only" if has_x and not has_tg else ("Telegram + X" if has_tg and has_x else ("Telegram" if has_tg else "thin socials"))
+    prompt = (
+        f"Project: {title_of(p)}\nChain: {p.get('chain')}\n"
+        f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTelegram: {p.get('telegram')}\n"
+        f"Site title: {comm.get('site_title')}\nAbout: {what}\n"
+        f"TG about: {comm.get('tg_about')}\nRecent X posts:\n{tweet_blob}\n"
+        f"Write a brief for a community operator. Door is: {door}.\n"
+        f"If only X exists, write REPLY-ready comments to their recent posts or a DM opener. "
+        f"If Telegram exists, write chat replies too.\n"
+        f"Use these labels exactly, each 1-2 sentences, human, specific to THIS product:\n"
+        f"CURIOUS\nINVESTOR\nSUGGESTION\nQUESTION\nSUPPORTER\nSTRATEGIST\nRANDOM\n"
+        f"No hashtags dump. No 'to the moon'."
+    )
+    generated = await llm_write(prompt)
+    header = [
         "🎯 <b>APPROACH BRIEF</b>",
         f"<b>{esc(title_of(p))}</b> · {s['band']} {s['score']}/100",
-        f"⛓ {esc((p.get('chain') or '?').title())} · 👥 {esc(members)}",
+        f"⛓ {esc((p.get('chain') or '?').title())} · Door: {esc(door)}",
         "",
         "📌 <b>What they appear to be</b>",
         esc(what)[:400],
         "",
         "💼 <b>Why you might be useful</b>",
         f"Roles: {esc(', '.join(s['roles']))}",
-        * [f"• {esc(item)}" for item in opportunity_signals(p)[:3]],
-        "",
-        "🗣️ <b>Do not open with GM bullish</b>",
-        "Walk in having read the site. Ask one specific question:",
-        "• How does the live product actually get used today?",
-        "• Which part of the docs is still confusing for new holders?",
-        "• Who is handling community questions right now?",
-        "",
-        f"Door: {esc(chat)}",
-        esc(s["action"]),
-    ])
+    ]
+    if generated:
+        body = ["", generated]
+    else:
+        body = [
+            "",
+            "⚠️ Add <code>GEMINI_API_KEY</code> on Railway for project-specific lines.",
+            "Until then, use these starters and edit them after you read the site:",
+            "",
+            "<b>CURIOUS</b>",
+            f"Just found {esc(title_of(p))} — the one-app/card angle is clearer than most. How do new users actually start?",
+            "<b>SUGGESTION</b>",
+            "A pinned ‘start here in 3 taps’ post would save you repeating the same setup questions.",
+            "<b>STRATEGIST</b>",
+            "Happy to draft FAQ replies from the site copy if you want a cleaner first-week chat.",
+            "<b>QUESTION</b>",
+            "Is the live product usable today without a waitlist, or is that still coming?",
+        ]
+        if tweets:
+            body += ["", "<b>Reply to their latest X</b>", esc((tweets[0].get("text") or "")[:160])]
+    extra = ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}", "Tap 🔀 Shuffle for a new set."]
+    return "\n".join(header + body + extra)
+
+
+def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
+    label = ", ".join(k.upper() for k in kinds)
+    return (
+        "📡 <b>SOCIAL SIGNAL</b>\n"
+        f"🪙 {esc(title_of(p))}\n"
+        f"Newly visible: <b>{esc(label)}</b>\n"
+        f"⛓ {esc((p.get('chain') or '?').title())}\n"
+        f"🕒 First seen on-chain: {esc(ago(p.get('discovered_at')))}\n"
+        f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
+        f"💬 {mark(p.get('telegram'))}\n"
+        "Project just became socially identifiable."
+    )
 
 
 def alert_text(p: dict[str, Any]) -> str:
@@ -1342,11 +1660,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     db, _ = deps(context)
     stats = await db.stats()
     owner = context.application.bot_data.get("allowed") or []
+    last_q = await db.get_meta("last_qualified_at")
+    last_scan = context.application.bot_data.get("last_scan_at")
+    last_cmd = context.application.bot_data.get("last_command_at")
     await update.effective_message.reply_html(
         "📡 <b>Scout status</b>\n"
         f"Projects stored: {stats['total']}\n"
         f"Qualified: {stats['qualified']}\n"
         f"Seen last 24h: {stats['last_24h']}\n"
+        f"Last new qualified: {esc(ago(int(last_q)) if last_q else 'none yet')}\n"
+        f"Last scan: {esc(ago(last_scan) if last_scan else 'not yet')}\n"
+        f"Last command: {esc(ago(last_cmd) if last_cmd else 'none')}\n"
+        f"Scanner: {'running' if context.application.bot_data.get('scan_alive') else 'restarting'}\n"
         f"Owner id: {owner[0] if owner else 'will lock on /start'}"
     )
 
@@ -1374,8 +1699,9 @@ async def cmd_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text("Unknown project id. Use /jobs first.")
         return
     project = await enrich_one(db, client, project, context.bot)
+    text = await approach_text(project)
     await update.effective_message.reply_html(
-        approach_text(project), disable_web_page_preview=True, reply_markup=report_keyboard(project)
+        text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
     )
 
 
@@ -1390,12 +1716,43 @@ async def cb_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.callback_query.edit_message_text("Project no longer in the database.")
         return
     project = await enrich_one(db, client, project, context.bot)
+    text = await approach_text(project)
     await update.callback_query.edit_message_text(
-        approach_text(project),
+        text,
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=report_keyboard(project),
     )
+
+
+async def cmd_early(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    db, client = deps(context)
+    x_items = await search_early_x(client)
+    rows = await db.qualified_since(now() - 48 * 3600)
+    social_first = [
+        p for p in rows
+        if (p.get("twitter") or p.get("telegram")) and (p.get("liquidity_usd") or 0) < 8000
+    ][:10]
+    lines = ["🌱 <b>EARLY / SOCIAL-FIRST</b>"]
+    if x_items:
+        lines.append("From X (last 7 days search):")
+        for i, item in enumerate(x_items[:8], 1):
+            user = item.get("username") or "?"
+            lines.append(
+                f"{i}. <b>@{esc(user)}</b> · {esc(item.get('name') or '')}\n"
+                f"{esc((item.get('text') or '')[:180])}\n"
+                f"https://x.com/{user}/status/{item.get('tweet_id')}"
+            )
+    else:
+        lines.append("X search off. Add <code>X_BEARER_TOKEN</code> on Railway for pre-token posts.")
+    if social_first:
+        lines += ["", "Token already live but still thin — socials showed up early:"]
+        for i, p in enumerate(social_first[:6], 1):
+            lines.append(list_item(i, p))
+    markup = list_keyboard(social_first, now() - 48 * 3600, 0, len(social_first)) if social_first else None
+    await update.effective_message.reply_html("\n\n".join(lines), disable_web_page_preview=True, reply_markup=markup)
 
 
 async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1520,27 +1877,86 @@ async def send_alerts(app: Application) -> None:
                 await db.mark_alerted(user_id, project["id"])
             except Exception as exc:
                 log.warning("alert failed for %s: %s", user_id, exc)
+    await send_social_alerts(app)
+
+
+async def send_social_alerts(app: Application) -> None:
+    db: DB = app.bot_data["db"]
+    owners: list[int] = app.bot_data.get("allowed") or []
+    if not owners:
+        raw = await db.get_meta("owner_id")
+        if raw:
+            owners = [int(raw)]
+            app.bot_data["allowed"] = owners
+    events = await db.pending_social_events(8)
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for ev in events:
+        grouped.setdefault(int(ev["project_id"]), []).append(ev)
+    for pid, evs in grouped.items():
+        project = await db.by_id(pid)
+        if not project:
+            for ev in evs:
+                await db.mark_social_alerted(ev["id"])
+            continue
+        kinds = [e["kind"] for e in evs]
+        if "x" not in kinds and "telegram" not in kinds:
+            for ev in evs:
+                await db.mark_social_alerted(ev["id"])
+            continue
+        for user_id in owners:
+            user = await db.ensure_user(user_id)
+            if not user.get("alerts_enabled", 1):
+                continue
+            try:
+                await app.bot.send_message(
+                    chat_id=user_id,
+                    text=social_alert_text(project, kinds),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=report_keyboard(project),
+                )
+            except Exception as exc:
+                log.warning("social alert failed: %s", exc)
+        for ev in evs:
+            await db.mark_social_alerted(ev["id"])
 
 
 async def discovery_loop(app: Application) -> None:
-    await asyncio.sleep(8)
+    app.bot_data["scan_alive"] = True
+    await asyncio.sleep(5)
     while True:
         try:
-            await discovery_once(app)
-            log.info("discovery cycle ok")
+            app.bot_data["scan_alive"] = True
+            last_cmd = int(app.bot_data.get("last_command_at") or 0)
+            busy = last_cmd and (now() - last_cmd) < 30
+            last_scan = int(app.bot_data.get("last_scan_at") or 0)
+            due = (now() - last_scan) >= int(os.getenv("DISCOVERY_INTERVAL_SEC", "90"))
+            idle_kick = last_cmd and (now() - last_cmd) >= 30 and (now() - last_scan) >= 30
+            if (due or idle_kick or not last_scan) and not busy:
+                await discovery_once(app)
+                app.bot_data["last_scan_at"] = now()
+                log.info("discovery cycle ok")
         except Exception:
             log.exception("discovery cycle failed")
-        await asyncio.sleep(int(os.getenv("DISCOVERY_INTERVAL_SEC", "120")))
+        await asyncio.sleep(8)
+
+
+async def note_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user:
+        context.application.bot_data["last_command_at"] = now()
 
 
 async def on_start(app: Application) -> None:
     db: DB = app.bot_data["db"]
     await db.connect()
     app.bot_data["http"] = httpx.AsyncClient(headers={"User-Agent": "Web3ProjectScout/1.0"}, timeout=25)
+    app.bot_data["last_command_at"] = 0
+    app.bot_data["last_scan_at"] = 0
+    app.bot_data["scan_alive"] = False
     owner = await db.get_meta("owner_id")
     if owner and not app.bot_data.get("allowed"):
         app.bot_data["allowed"] = [int(owner)]
-    app.create_task(discovery_loop(app))
+    app.create_task(discovery_loop(app), name="scout-discovery")
     me = await app.bot.get_me()
     log.info("Logged in as @%s", me.username)
 
@@ -1563,12 +1979,14 @@ def main() -> None:
     app = (
         Application.builder()
         .token(token)
+        .concurrent_updates(True)
         .post_init(on_start)
         .post_shutdown(on_stop)
         .build()
     )
     app.bot_data["db"] = db
     app.bot_data["allowed"] = allowed_ids
+    app.add_handler(TypeHandler(Update, note_activity), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("newtokens", cmd_newtokens))
@@ -1581,6 +1999,7 @@ def main() -> None:
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("approach", cmd_approach))
+    app.add_handler(CommandHandler("early", cmd_early))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(cb_newtokens, pattern=r"^nt:"))
     app.add_handler(CallbackQueryHandler(cb_investigate, pattern=r"^inv:"))
