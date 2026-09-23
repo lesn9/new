@@ -47,7 +47,8 @@ GECKO_CHAIN = {
     "avax": "avalanche", "optimism": "optimism", "sui-network": "sui",
     "sui": "sui", "ton": "ton", "abstract": "abstract", "hyperevm": "hyperevm",
     "hyperliquid": "hyperevm", "monad": "monad", "ink": "ink",
-    "robinhood": "robinhood", "sonic": "sonic", "blast": "blast",
+    "robinhood": "robinhood", "robinhood-chain": "robinhood",
+    "arc": "arc", "sonic": "sonic", "blast": "blast",
     "linea": "linea", "berachain": "berachain", "unichain": "unichain",
 }
 
@@ -998,10 +999,10 @@ async def llm_write(prompt: str) -> str | None:
         KEY_STATUS["gemini"] = "present"
         models = [
             os.getenv("GEMINI_MODEL") or "",
-            "gemini-2.0-flash",
             "gemini-2.5-flash",
+            "gemini-2.0-flash",
             "gemini-flash-latest",
-            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash-lite",
         ]
         seen: set[str] = set()
         last_err = ""
@@ -1034,44 +1035,53 @@ async def llm_write(prompt: str) -> str | None:
                     last_err = f"{model} empty"
             KEY_STATUS["llm_error"] = last_err or "gemini empty"
             KEY_STATUS["gemini"] = last_err or "failed"
-            return None
         except Exception as exc:
             KEY_STATUS["llm_error"] = str(exc)[:80]
+            KEY_STATUS["gemini"] = "error"
             log.warning("Gemini failed: %s", exc)
-            return None
-    KEY_STATUS["gemini"] = "missing"
-    if xai:
-        url, key, model = "https://api.x.ai/v1/chat/completions", xai, os.getenv("XAI_MODEL", "grok-4-1-fast")
-    elif oai:
-        url, key, model = "https://api.openai.com/v1/chat/completions", oai, "gpt-4o-mini"
     else:
+        KEY_STATUS["gemini"] = "missing"
+    providers: list[tuple[str, str, str]] = []
+    if xai:
+        for model in (
+            os.getenv("XAI_MODEL") or "",
+            "grok-4-fast",
+            "grok-3-mini",
+            "grok-2-latest",
+            "grok-4-1-fast",
+        ):
+            if model:
+                providers.append(("xai", xai, model))
+    if oai:
+        providers.append(("openai", oai, "gpt-4o-mini"))
+    if not providers:
         return None
     try:
         async with httpx.AsyncClient(timeout=45) as client:
-            resp = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "temperature": 0.7,
-                    "max_tokens": 900,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You write short, human crypto community comments. "
-                                "No GM bullish. No investment advice. No fake claims. "
-                                "Sound like a real person who actually read the project."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-            )
-        if resp.status_code >= 400:
-            log.warning("LLM %s: %s", resp.status_code, resp.text[:240])
-            return None
-        return resp.json()["choices"][0]["message"]["content"].strip()
+            for kind, key, model in providers:
+                url = "https://api.x.ai/v1/chat/completions" if kind == "xai" else "https://api.openai.com/v1/chat/completions"
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={
+                        "model": model,
+                        "temperature": 0.7,
+                        "max_tokens": 900,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                    },
+                )
+                if resp.status_code >= 400:
+                    KEY_STATUS["xai" if kind == "xai" else "openai"] = f"{model} http {resp.status_code}"
+                    log.warning("LLM %s %s: %s", kind, resp.status_code, resp.text[:200])
+                    continue
+                text = resp.json()["choices"][0]["message"]["content"].strip()
+                if text:
+                    KEY_STATUS["xai" if kind == "xai" else "openai"] = f"ok:{model}"
+                    return text
+        return None
     except Exception as exc:
         log.warning("LLM failed: %s", exc)
         return None
@@ -1103,15 +1113,43 @@ async def enrich_community(bot, client: httpx.AsyncClient, project: dict[str, An
     tg_url = project.get("telegram") or payload.get("found_telegram")
     tg = await fetch_telegram(bot, tg_url or "")
     payload.update(tg)
-    if not tg_url:
-        payload.update(await guess_telegram(bot, project))
     handle = x_handle(project.get("twitter") or payload.get("found_twitter"))
     if handle:
         payload["x_handle"] = handle
         tweets = await fetch_x_tweets(client, handle)
         if tweets:
             payload["x_tweets"] = tweets[:5]
+            if not tg_url:
+                for tw in tweets:
+                    found = re.findall(r"https?://t\.me/[A-Za-z0-9_+]+", tw.get("text") or "")
+                    if found:
+                        payload["found_telegram"] = found[0]
+                        payload.update(await fetch_telegram(bot, found[0]))
+                        break
+    extra = await extra_onchain(client, project)
+    payload.update(extra)
     return payload
+
+
+async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    chain = (project.get("chain") or "").lower()
+    addr = project.get("token_address") or ""
+    if chain == "solana" and addr:
+        data = await http_get(client, f"https://frontend-api.pump.fun/coins/{addr}")
+        if isinstance(data, dict) and (data.get("mint") or data.get("creator")):
+            if data.get("creator"):
+                out["deployer"] = data["creator"]
+            if data.get("holder_count") is not None:
+                out["holders"] = data.get("holder_count")
+            if data.get("twitter") and not project.get("twitter"):
+                out["found_twitter"] = data["twitter"] if str(data["twitter"]).startswith("http") else f"https://x.com/{str(data['twitter']).lstrip('@')}"
+            if data.get("telegram") and not project.get("telegram"):
+                out["found_telegram"] = data["telegram"]
+            if data.get("website") and not project.get("website"):
+                out["found_website"] = data["website"]
+            out["pump_complete"] = data.get("complete")
+    return out
 
 
 # ---------- reports ----------
@@ -1295,6 +1333,10 @@ def report_text(p: dict[str, Any]) -> str:
         "👥 <b>COMMUNITY</b>",
     ]
     comm = community(p)
+    if comm.get("deployer"):
+        lines.append(f"Deployer: <code>{esc(comm['deployer'])}</code>")
+    if comm.get("holders") is not None:
+        lines.append(f"Holders: {esc(comm.get('holders'))}")
     if comm.get("tg_title") or comm.get("tg_members"):
         lines.append(
             f"TG: {esc(comm.get('tg_title') or 'public chat')} · "
@@ -1398,7 +1440,7 @@ async def approach_text(p: dict[str, Any]) -> str:
         f"Roles: {esc(', '.join(s['roles']))}",
     ]
     if generated:
-        body = ["", generated]
+        body = ["", copyable_brief(generated)]
     else:
         name = esc(title_of(p))
         about = esc(what)[:80]
@@ -1452,16 +1494,38 @@ async def approach_text(p: dict[str, Any]) -> str:
                 "This might be the first ticker today that tried to explain itself. Respect.",
             ],
         ]
+        chosen = packs[random.randint(0, len(packs) - 1)]
+        wrapped = []
+        for line in chosen:
+            if line.startswith("<b>"):
+                wrapped.append(line)
+            else:
+                wrapped.append(f"<code>{line}</code>")
         body = [
             "",
-            f"⚠️ Gemini not writing yet: <code>{esc(KEY_STATUS.get('gemini') or 'missing')}</code>",
-            "Shuffle still gives a new fallback set. Fix the key to get project-specific lines.",
+            f"⚠️ AI fallback · Gemini {esc(KEY_STATUS.get('gemini') or '?')} · xAI {esc(KEY_STATUS.get('xai') or 'not tried')}",
+            "Tap a grey line to copy. Shuffle for another set.",
             "",
-        ] + packs[random.randint(0, len(packs) - 1)]
+        ] + wrapped
         if tweets:
             body += ["", "<b>Reply to their latest X</b>", esc((tweets[0].get("text") or "")[:160])]
     extra = ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}", "Tap 🔀 Shuffle for a new set."]
     return "\n".join(header + body + extra)
+
+
+def copyable_brief(text: str) -> str:
+    labels = {"CURIOUS", "INVESTOR", "SUGGESTION", "QUESTION", "SUPPORTER", "STRATEGIST", "RANDOM"}
+    out: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        key = re.sub(r"[^A-Za-z]", "", line).upper()
+        if key in labels:
+            out.append(f"<b>{esc(key)}</b>")
+        elif line:
+            out.append(f"<code>{esc(line)}</code>")
+        else:
+            out.append("")
+    return "\n".join(out)
 
 
 def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
@@ -1503,7 +1567,10 @@ def allowed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
-    if not user or not allowed(user.id, context):
+    if not user:
+        return False
+    await claim_owner_if_needed(context, user.id)
+    if not allowed(user.id, context):
         if update.effective_message:
             await update.effective_message.reply_text("This Scout is private.")
         return False
@@ -1674,7 +1741,10 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await update.callback_query.edit_message_text("Project no longer in the database.")
+        await update.callback_query.answer(
+            "That button is from before a restart. Send /jobs and open it again.",
+            show_alert=True,
+        )
         return
     project = await enrich_one(db, client, project, context.bot)
     await update.callback_query.edit_message_text(
@@ -1763,6 +1833,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Gemini: {esc(KEY_STATUS.get('gemini') or 'not tried')}\n"
         f"X bearer: {esc(KEY_STATUS.get('x') or 'not tried')} {'set' if env_secret('X_BEARER_TOKEN','TWITTER_BEARER_TOKEN') else 'NOT in env'}\n"
         f"Gemini env: {'set' if env_secret('GEMINI_API_KEY','GOOGLE_API_KEY','GOOGLE_GEMINI_API_KEY') else 'NOT in env'}\n"
+        f"DB: {esc(str(db.path))}\n"
         f"Owner id: {owner[0] if owner else 'will lock on /start'}"
     )
 
@@ -1804,15 +1875,15 @@ async def cb_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await update.callback_query.edit_message_text("Project no longer in the database.")
+        await update.callback_query.answer(
+            "That button is from before a restart. Send /jobs and tap Approach there.",
+            show_alert=True,
+        )
         return
     project = await enrich_one(db, client, project, context.bot)
     text = await approach_text(project)
-    await update.callback_query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=report_keyboard(project),
+    await update.callback_query.message.reply_html(
+        text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
     )
 
 
