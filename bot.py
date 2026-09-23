@@ -130,10 +130,15 @@ Finds early public-facing projects and stores them while you sleep.
 Alerts:
 🚨 new public project
 📡 socials appeared later (X/TG showed up after first seen)
+
+Labels:
+🔧 Utility — product / protocol / tool signals
+🐸 Meme — culture / ticker / no-product signals
+⚖️ Mixed — unclear from public text
 """
 
 
-KEY_STATUS: dict[str, str] = {"gemini": "not set", "x": "not set", "xai": "not set", "llm_error": ""}
+KEY_STATUS: dict[str, str] = {"gemini": "not set", "x": "not set", "xai": "not set", "groq": "not set", "openrouter": "not set", "llm_error": ""}
 
 
 def env_secret(*names: str) -> str:
@@ -987,6 +992,9 @@ async def search_early_x(client: httpx.AsyncClient) -> list[dict[str, Any]]:
 
 
 async def llm_write(prompt: str) -> str | None:
+    """Try free providers first (Groq → OpenRouter → Gemini → xAI → OpenAI)."""
+    groq = env_secret("GROQ_API_KEY")
+    openrouter = env_secret("OPENROUTER_API_KEY", "OPENROUTER_KEY")
     gemini = env_secret("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY")
     xai = env_secret("XAI_API_KEY")
     oai = env_secret("OPENAI_API_KEY")
@@ -996,7 +1004,99 @@ async def llm_write(prompt: str) -> str | None:
         "Sound like a real person who actually read the project."
     )
 
-    # --- Gemini (try several current model ids) ---
+    # --- Groq (best free, OpenAI-compatible) ---
+    if groq:
+        KEY_STATUS["groq"] = "present"
+        models = [
+            (os.getenv("GROQ_MODEL") or "").strip(),
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "openai/gpt-oss-120b",
+            "qwen/qwen3-32b",
+        ]
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                for model in models:
+                    if not model:
+                        continue
+                    resp = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {groq}", "Content-Type": "application/json"},
+                        json={
+                            "model": model,
+                            "temperature": 0.8,
+                            "max_tokens": 900,
+                            "messages": [
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": prompt},
+                            ],
+                        },
+                    )
+                    if resp.status_code >= 400:
+                        KEY_STATUS["groq"] = f"{model} http {resp.status_code}"
+                        log.warning("Groq %s: %s", resp.status_code, (resp.text or "")[:200])
+                        continue
+                    text = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+                    if text:
+                        KEY_STATUS["groq"] = f"ok:{model}"
+                        KEY_STATUS["llm_error"] = ""
+                        return text
+        except Exception as exc:
+            KEY_STATUS["groq"] = "error"
+            log.warning("Groq failed: %s", exc)
+    else:
+        KEY_STATUS["groq"] = "missing"
+
+    # --- OpenRouter free models ---
+    if openrouter:
+        KEY_STATUS["openrouter"] = "present"
+        models = [
+            (os.getenv("OPENROUTER_MODEL") or "").strip(),
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "qwen/qwen3-235b-a22b:free",
+            "deepseek/deepseek-chat-v3.1:free",
+            "google/gemini-2.0-flash-exp:free",
+            "openrouter/auto",
+        ]
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                for model in models:
+                    if not model:
+                        continue
+                    resp = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {openrouter}",
+                            "Content-Type": "application/json",
+                            "HTTP-Referer": "https://github.com/web3-project-scout",
+                            "X-Title": "Web3 Project Scout",
+                        },
+                        json={
+                            "model": model,
+                            "temperature": 0.8,
+                            "max_tokens": 900,
+                            "messages": [
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": prompt},
+                            ],
+                        },
+                    )
+                    if resp.status_code >= 400:
+                        KEY_STATUS["openrouter"] = f"{model} http {resp.status_code}"
+                        log.warning("OpenRouter %s: %s", resp.status_code, (resp.text or "")[:200])
+                        continue
+                    text = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+                    if text:
+                        KEY_STATUS["openrouter"] = f"ok:{model}"
+                        KEY_STATUS["llm_error"] = ""
+                        return text
+        except Exception as exc:
+            KEY_STATUS["openrouter"] = "error"
+            log.warning("OpenRouter failed: %s", exc)
+    else:
+        KEY_STATUS["openrouter"] = "missing"
+
+    # --- Gemini ---
     if gemini:
         KEY_STATUS["gemini"] = "present"
         models = [
@@ -1005,7 +1105,6 @@ async def llm_write(prompt: str) -> str | None:
             "gemini-2.0-flash",
             "gemini-1.5-flash",
             "gemini-2.5-flash-lite",
-            "gemini-flash-latest",
         ]
         seen: set[str] = set()
         last_err = ""
@@ -1015,9 +1114,8 @@ async def llm_write(prompt: str) -> str | None:
                     if not model or model in seen:
                         continue
                     seen.add(model)
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                     resp = await client.post(
-                        url,
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                         params={"key": gemini},
                         headers={"Content-Type": "application/json"},
                         json={
@@ -1046,7 +1144,7 @@ async def llm_write(prompt: str) -> str | None:
     else:
         KEY_STATUS["gemini"] = "missing"
 
-    # --- xAI / OpenAI fallbacks ---
+    # --- xAI / OpenAI last ---
     providers: list[tuple[str, str, str]] = []
     if xai:
         for model in (
@@ -1055,7 +1153,6 @@ async def llm_write(prompt: str) -> str | None:
             "grok-4.6",
             "grok-4.1-fast",
             "grok-3-mini",
-            "grok-2-latest",
         ):
             if model:
                 providers.append(("xai", xai, model))
@@ -1144,38 +1241,143 @@ async def enrich_community(bot, client: httpx.AsyncClient, project: dict[str, An
 
 
 async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> dict[str, Any]:
-    """Best-effort free on-chain extras. Solana pump.fun gives deployer + holders.
-    Other chains stay empty until a free reliable source is available.
+    """Best-effort free on-chain extras.
+    Solana: Rugcheck (creator + holders) + pump.fun when available.
     """
     out: dict[str, Any] = {}
     chain = (project.get("chain") or "").lower()
-    addr = project.get("token_address") or ""
+    addr = (project.get("token_address") or "").strip()
     if not addr:
         return out
+
     if chain == "solana":
-        data = await http_get(client, f"https://frontend-api.pump.fun/coins/{addr}")
-        if isinstance(data, dict) and (data.get("mint") or data.get("creator")):
-            if data.get("creator"):
-                out["deployer"] = data["creator"]
-            if data.get("holder_count") is not None:
-                out["holders"] = data.get("holder_count")
-            if data.get("twitter") and not project.get("twitter"):
-                tw = str(data["twitter"])
-                out["found_twitter"] = tw if tw.startswith("http") else f"https://x.com/{tw.lstrip('@')}"
-            if data.get("telegram") and not project.get("telegram"):
-                out["found_telegram"] = data["telegram"]
-            if data.get("website") and not project.get("website"):
-                out["found_website"] = data["website"]
-            out["pump_complete"] = data.get("complete")
-            if data.get("usd_market_cap") is not None:
-                out["pump_mcap"] = data.get("usd_market_cap")
-    # DexScreener pair data sometimes has pairCreatedBy / makers — not reliable for deployer
+        # 1) Rugcheck — free, reliable creator + totalHolders
+        try:
+            resp = await client.get(
+                f"https://api.rugcheck.xyz/v1/tokens/{addr}/report",
+                headers={"User-Agent": "Web3ProjectScout/1.0"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    if data.get("creator"):
+                        out["deployer"] = data["creator"]
+                    holders = data.get("totalHolders")
+                    if holders is not None:
+                        try:
+                            out["holders"] = int(holders)
+                        except (TypeError, ValueError):
+                            pass
+                    if data.get("score") is not None:
+                        out["rugcheck_score"] = data.get("score")
+                    if data.get("score_normalised") is not None:
+                        out["rugcheck_score_norm"] = data.get("score_normalised")
+                    if data.get("rugged") is not None:
+                        out["rugged"] = data.get("rugged")
+                    top = data.get("topHolders") or []
+                    if top and isinstance(top, list):
+                        out["top_holders_n"] = len(top)
+        except Exception as exc:
+            log.warning("rugcheck failed %s: %s", addr[:12], exc)
+
+        # 2) pump.fun fallback (often down, but try)
+        if not out.get("deployer") or out.get("holders") is None:
+            data = await http_get(client, f"https://frontend-api.pump.fun/coins/{addr}")
+            if not isinstance(data, dict):
+                data = await http_get(client, f"https://frontend-api-v2.pump.fun/coins/{addr}")
+            if isinstance(data, dict) and (data.get("mint") or data.get("creator")):
+                if data.get("creator") and not out.get("deployer"):
+                    out["deployer"] = data["creator"]
+                if data.get("holder_count") is not None and out.get("holders") is None:
+                    out["holders"] = data.get("holder_count")
+                if data.get("twitter") and not project.get("twitter"):
+                    tw = str(data["twitter"])
+                    out["found_twitter"] = tw if tw.startswith("http") else f"https://x.com/{tw.lstrip('@')}"
+                if data.get("telegram") and not project.get("telegram"):
+                    out["found_telegram"] = data["telegram"]
+                if data.get("website") and not project.get("website"):
+                    out["found_website"] = data["website"]
+                out["pump_complete"] = data.get("complete")
+                if data.get("usd_market_cap") is not None:
+                    out["pump_mcap"] = data.get("usd_market_cap")
+
     return out
 
 
 # ---------- reports ----------
 
+def classify_project(p: dict[str, Any]) -> dict[str, Any]:
+    """Heuristic: utility vs meme vs mixed. Not financial advice — for job-hunt triage."""
+    name = str(p.get("name") or "").lower()
+    symbol = str(p.get("symbol") or "").lower()
+    desc = str(p.get("description") or "").lower()
+    comm = community(p)
+    site = str(comm.get("site_about") or "").lower()
+    tg = str(comm.get("tg_about") or "").lower()
+    blob = " ".join([name, symbol, desc, site, tg])
+
+    utility_kw = [
+        "ai ", " artificial", "agent", "infra", "protocol", "defi", "lend", "borrow",
+        "stake", "staking", "yield", "swap", "dex", "bridge", "oracle", "layer",
+        "l2", "rollup", "zk", "privacy", "identity", "wallet", "sdk", "api ",
+        "tool", "platform", "marketplace", "nft utility", "gamefi", "play to earn",
+        "rwa", "real world", "payment", "payfi", "compute", "storage", "data ",
+        "governance", "dao", "launchpad", "restake", "liquid staking", "perps",
+        "perpetual", "derivatives", "options", "insurance", "prediction",
+        "socialfi", "creator economy", "subscription", "saas", "b2b", "enterprise",
+        "testnet", "mainnet", "docs", "whitepaper", "roadmap", "utility token",
+    ]
+    meme_kw = [
+        "meme", "pepe", "doge", "wojak", "chad", "based", "only up", "moon",
+        "pump", "to the moon", "community coin", "fair launch", "no utility",
+        "just a meme", "culture", "vibes", "funny", "cat coin", "dog coin",
+        "frog", "inu ", "shiba", "elon", "trump", "maga", "animal",
+        "mascot", "ticker", "cto", "community take over",
+    ]
+
+    u_hits = sum(1 for k in utility_kw if k in blob)
+    m_hits = sum(1 for k in meme_kw if k in blob)
+
+    has_docs = bool(p.get("docs"))
+    has_site = bool(p.get("website"))
+    has_desc = len(desc) > 60
+    long_product = any(x in blob for x in ("how it works", "use case", "product", "users can", "built for"))
+
+    # structural signals
+    if has_docs:
+        u_hits += 3
+    if has_site and has_desc:
+        u_hits += 2
+    if long_product:
+        u_hits += 2
+    if not has_site and not has_docs and len(desc) < 30:
+        m_hits += 2
+    # pure ticker / animal names without product language
+    if m_hits >= 2 and u_hits == 0:
+        m_hits += 1
+
+    if u_hits >= 3 and u_hits > m_hits:
+        kind = "utility"
+        label = "🔧 Utility"
+    elif m_hits >= 2 and m_hits >= u_hits:
+        kind = "meme"
+        label = "🐸 Meme"
+    elif u_hits >= 1 and has_docs:
+        kind = "utility"
+        label = "🔧 Utility"
+    elif u_hits == 0 and m_hits == 0 and not has_docs and not has_desc:
+        kind = "meme"
+        label = "🐸 Likely meme"
+    else:
+        kind = "mixed"
+        label = "⚖️ Mixed / unclear"
+
+    return {"kind": kind, "label": label, "utility_hits": u_hits, "meme_hits": m_hits}
+
+
 def score_project(p: dict[str, Any]) -> dict[str, Any]:
+
     """Heuristic score for community / social opportunity — not a trade call."""
     score = 0
     roles: list[str] = []
@@ -1210,6 +1412,13 @@ def score_project(p: dict[str, Any]) -> dict[str, Any]:
         score += 8
     if comm.get("site_about") and not desc:
         score += 6
+    kind = classify_project(p)
+    if kind["kind"] == "utility":
+        score += 14
+        if "Utility / product" not in roles:
+            roles.append("Utility / product")
+    elif kind["kind"] == "meme":
+        score += 2  # still scorable for community work, but lower priority
     if p.get("docs"):
         score += 10
     else:
@@ -1306,8 +1515,9 @@ def observations_for(p: dict[str, Any]) -> list[str]:
 
 def list_item(index: int, p: dict[str, Any]) -> str:
     s = score_project(p)
+    kind = classify_project(p)
     return (
-        f"<b>{index}.</b> {esc(title_of(p))} · {s['band']} {s['score']}\n"
+        f"<b>{index}.</b> {esc(title_of(p))} · {s['band']} {s['score']} · {kind['label']}\n"
         f"⛓ {esc((p.get('chain') or '?').title())} · 🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}\n"
         f"💧 {esc(money(p.get('liquidity_usd')))} · 📊 {esc(money(p.get('volume_24h')))}\n"
         f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
@@ -1339,6 +1549,7 @@ def report_text(p: dict[str, Any]) -> str:
         f"⛓ {(p.get('chain') or '?').title()}",
         f"🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}",
         f"🎯 Opportunity: <b>{s['band']}</b> {s['score']}/100",
+        f"{classify_project(p)['label']}",
         f"🏷 CA: <code>{esc(p.get('token_address') or '')}</code>",
         f"🕒 First stored: {esc(ago(p.get('discovered_at')))}",
         "",
@@ -1461,6 +1672,12 @@ def onchain_text(p: dict[str, Any]) -> str:
         lines.append(f"Pump.fun graduated: {'yes' if comm.get('pump_complete') else 'no'}")
     if comm.get("pump_mcap") is not None:
         lines.append(f"Pump mcap: {esc(money(to_float(comm.get('pump_mcap'))))}")
+    if comm.get("rugcheck_score") is not None:
+        lines.append(f"Rugcheck score: {esc(comm.get('rugcheck_score'))} (lower is safer)")
+    if comm.get("rugged"):
+        lines.append("⚠️ Rugcheck flagged rugged")
+    kind = classify_project(p)
+    lines.append(f"Type: {kind['label']}")
     lines += [
         "",
         "📊 Market snapshot",
@@ -1902,10 +2119,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Last scan: {esc(ago(last_scan) if last_scan else 'not yet')}\n"
         f"Last command: {esc(ago(last_cmd) if last_cmd else 'none')}\n"
         f"Scanner: {'running' if context.application.bot_data.get('scan_alive') else 'restarting'}\n"
+        f"Groq: {esc(KEY_STATUS.get('groq') or 'not tried')} {'set' if env_secret('GROQ_API_KEY') else 'NOT in env'}\n"
+        f"OpenRouter: {esc(KEY_STATUS.get('openrouter') or 'not tried')} {'set' if env_secret('OPENROUTER_API_KEY','OPENROUTER_KEY') else 'NOT in env'}\n"
         f"Gemini: {esc(KEY_STATUS.get('gemini') or 'not tried')}\n"
         f"xAI: {esc(KEY_STATUS.get('xai') or 'not tried')} {'set' if env_secret('XAI_API_KEY') else 'NOT in env'}\n"
         f"X bearer: {esc(KEY_STATUS.get('x') or 'not tried')} {'set' if env_secret('X_BEARER_TOKEN','TWITTER_BEARER_TOKEN') else 'NOT in env'}\n"
-        f"Gemini env: {'set' if env_secret('GEMINI_API_KEY','GOOGLE_API_KEY','GOOGLE_GEMINI_API_KEY') else 'NOT in env'}\n"
         f"DB: {esc(str(db.path))}\n"
         f"Owner id: {owner[0] if owner else 'will lock on /start'}"
     )
