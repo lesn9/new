@@ -7,10 +7,12 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime
 from typing import Any
+from urllib.parse import unquote
 
 import aiosqlite
 import httpx
@@ -128,6 +130,21 @@ Alerts:
 🚨 new public project
 📡 socials appeared later (X/TG showed up after first seen)
 """
+
+
+KEY_STATUS: dict[str, str] = {"gemini": "not set", "x": "not set", "llm_error": ""}
+
+
+def env_secret(*names: str) -> str:
+    for name in names:
+        raw = os.getenv(name)
+        if not raw:
+            continue
+        raw = raw.strip().strip('"').strip("'")
+        raw = unquote(raw)
+        if raw:
+            return raw
+    return ""
 
 
 def env_ints(name: str) -> list[int]:
@@ -890,7 +907,7 @@ async def fetch_telegram(bot, url: str) -> dict[str, Any]:
 
 
 async def fetch_x_tweets(client: httpx.AsyncClient, handle: str) -> list[dict[str, Any]]:
-    token = os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN") or ""
+    token = env_secret("X_BEARER_TOKEN", "TWITTER_BEARER_TOKEN")
     if not token or not handle:
         return []
     headers = {"Authorization": f"Bearer {token}"}
@@ -923,9 +940,11 @@ async def fetch_x_tweets(client: httpx.AsyncClient, handle: str) -> list[dict[st
 
 
 async def search_early_x(client: httpx.AsyncClient) -> list[dict[str, Any]]:
-    token = os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN") or ""
+    token = env_secret("X_BEARER_TOKEN", "TWITTER_BEARER_TOKEN")
     if not token:
+        KEY_STATUS["x"] = "missing"
         return []
+    KEY_STATUS["x"] = "present"
     query = (
         '("we just launched" OR "testnet is live" OR "join our telegram" OR "docs are live" '
         'OR "building in public") (web3 OR crypto OR L2 OR "ai agent") -is:retweet -is:reply lang:en'
@@ -944,6 +963,7 @@ async def search_early_x(client: httpx.AsyncClient) -> list[dict[str, Any]]:
             timeout=20,
         )
         if resp.status_code >= 400:
+            KEY_STATUS["x"] = f"http {resp.status_code}"
             log.warning("X early search %s: %s", resp.status_code, resp.text[:200])
             return []
         data = resp.json()
@@ -966,36 +986,60 @@ async def search_early_x(client: httpx.AsyncClient) -> list[dict[str, Any]]:
 
 
 async def llm_write(prompt: str) -> str | None:
-    gemini = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-    xai = os.getenv("XAI_API_KEY") or ""
-    oai = os.getenv("OPENAI_API_KEY") or ""
+    gemini = env_secret("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY")
+    xai = env_secret("XAI_API_KEY")
+    oai = env_secret("OPENAI_API_KEY")
     system = (
         "You write short, human crypto community comments. "
         "No GM bullish. No investment advice. No fake claims. "
         "Sound like a real person who actually read the project."
     )
     if gemini:
+        KEY_STATUS["gemini"] = "present"
+        models = [
+            os.getenv("GEMINI_MODEL") or "",
+            "gemini-2.0-flash",
+            "gemini-2.5-flash",
+            "gemini-flash-latest",
+            "gemini-2.0-flash-lite",
+        ]
+        seen: set[str] = set()
+        last_err = ""
         try:
             async with httpx.AsyncClient(timeout=45) as client:
-                model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-                resp = await client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    headers={"x-goog-api-key": gemini, "Content-Type": "application/json"},
-                    json={
-                        "system_instruction": {"parts": [{"text": system}]},
-                        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 900},
-                    },
-                )
-            if resp.status_code >= 400:
-                log.warning("Gemini %s: %s", resp.status_code, resp.text[:240])
-                return None
-            parts = (((resp.json().get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
-            text = "".join(p.get("text") or "" for p in parts).strip()
-            return text or None
+                for model in models:
+                    if not model or model in seen:
+                        continue
+                    seen.add(model)
+                    resp = await client.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                        headers={"x-goog-api-key": gemini, "Content-Type": "application/json"},
+                        params={"key": gemini},
+                        json={
+                            "system_instruction": {"parts": [{"text": system}]},
+                            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                            "generationConfig": {"temperature": 0.9, "maxOutputTokens": 900},
+                        },
+                    )
+                    if resp.status_code >= 400:
+                        last_err = f"{model} http {resp.status_code}"
+                        log.warning("Gemini %s: %s", resp.status_code, resp.text[:240])
+                        continue
+                    parts = (((resp.json().get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
+                    text = "".join(p.get("text") or "" for p in parts).strip()
+                    if text:
+                        KEY_STATUS["llm_error"] = ""
+                        KEY_STATUS["gemini"] = f"ok:{model}"
+                        return text
+                    last_err = f"{model} empty"
+            KEY_STATUS["llm_error"] = last_err or "gemini empty"
+            KEY_STATUS["gemini"] = last_err or "failed"
+            return None
         except Exception as exc:
+            KEY_STATUS["llm_error"] = str(exc)[:80]
             log.warning("Gemini failed: %s", exc)
             return None
+    KEY_STATUS["gemini"] = "missing"
     if xai:
         url, key, model = "https://api.x.ai/v1/chat/completions", xai, os.getenv("XAI_MODEL", "grok-4-1-fast")
     elif oai:
@@ -1339,7 +1383,7 @@ async def approach_text(p: dict[str, Any]) -> str:
         f"If Telegram exists, write chat replies too.\n"
         f"Use these labels exactly, each 1-2 sentences, human, specific to THIS product:\n"
         f"CURIOUS\nINVESTOR\nSUGGESTION\nQUESTION\nSUPPORTER\nSTRATEGIST\nRANDOM\n"
-        f"No hashtags dump. No 'to the moon'."
+        f"No hashtags dump. No 'to the moon'. Variation seed {random.randint(1, 9999)} — write a FRESH set."
     )
     generated = await llm_write(prompt)
     header = [
@@ -1356,20 +1400,64 @@ async def approach_text(p: dict[str, Any]) -> str:
     if generated:
         body = ["", generated]
     else:
+        name = esc(title_of(p))
+        about = esc(what)[:80]
+        packs = [
+            [
+                "<b>CURIOUS</b>",
+                f"Just landed on {name}. {about} — how does a first-time user actually try this today?",
+                "<b>INVESTOR</b>",
+                "Not asking for a price call. Who is the user that pays, and what do they get that a meme page does not?",
+                "<b>SUGGESTION</b>",
+                "Pin a 3-line 'how this works' so the chat stops repeating the same setup questions.",
+                "<b>QUESTION</b>",
+                "Is the product live for anyone, or still waitlist / friends-and-family?",
+                "<b>SUPPORTER</b>",
+                f"The positioning on {name} is clearer than most launches this week. Keep posting the actual use, not candles.",
+                "<b>STRATEGIST</b>",
+                "I can turn the site copy into FAQ replies for the first week if you want a cleaner chat.",
+                "<b>RANDOM</b>",
+                "Ok wait. So this is less 'number go up' and more a product people are supposed to open daily?",
+            ],
+            [
+                "<b>CURIOUS</b>",
+                f"Saw {name} on Dex and then the X. What's the one action you want a new person to take in the first 5 minutes?",
+                "<b>INVESTOR</b>",
+                "If I ignore the chart: what's the loop that brings someone back after day one?",
+                "<b>SUGGESTION</b>",
+                "A short clip walking through one real use would beat another slogan post.",
+                "<b>QUESTION</b>",
+                "Where should a confused holder ask questions — X replies or the Telegram?",
+                "<b>SUPPORTER</b>",
+                "This reads like a team that knows the joke. Don't bury the actual mechanic under memes.",
+                "<b>STRATEGIST</b>",
+                "Happy to draft reply templates for the 5 questions every new token chat gets.",
+                "<b>RANDOM</b>",
+                "Be honest — is this something I open, or something I just hold?",
+            ],
+            [
+                "<b>CURIOUS</b>",
+                f"{name} clicked because the line isn't generic. Who is this actually for?",
+                "<b>INVESTOR</b>",
+                "What's already shipped vs what's still a screenshot?",
+                "<b>SUGGESTION</b>",
+                "Put official links in the Telegram description so people stop asking for the CA.",
+                "<b>QUESTION</b>",
+                "Any public doc or FAQ besides the X bio?",
+                "<b>SUPPORTER</b>",
+                "Following. Will share if the product demo is as clean as the copy.",
+                "<b>STRATEGIST</b>",
+                "If you want, I can sit in the chat this week and answer newbie questions from the site text.",
+                "<b>RANDOM</b>",
+                "This might be the first ticker today that tried to explain itself. Respect.",
+            ],
+        ]
         body = [
             "",
-            "⚠️ Add <code>GEMINI_API_KEY</code> on Railway for project-specific lines.",
-            "Until then, use these starters and edit them after you read the site:",
+            f"⚠️ Gemini not writing yet: <code>{esc(KEY_STATUS.get('gemini') or 'missing')}</code>",
+            "Shuffle still gives a new fallback set. Fix the key to get project-specific lines.",
             "",
-            "<b>CURIOUS</b>",
-            f"Just found {esc(title_of(p))} — the one-app/card angle is clearer than most. How do new users actually start?",
-            "<b>SUGGESTION</b>",
-            "A pinned ‘start here in 3 taps’ post would save you repeating the same setup questions.",
-            "<b>STRATEGIST</b>",
-            "Happy to draft FAQ replies from the site copy if you want a cleaner first-week chat.",
-            "<b>QUESTION</b>",
-            "Is the live product usable today without a waitlist, or is that still coming?",
-        ]
+        ] + packs[random.randint(0, len(packs) - 1)]
         if tweets:
             body += ["", "<b>Reply to their latest X</b>", esc((tweets[0].get("text") or "")[:160])]
     extra = ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}", "Tap 🔀 Shuffle for a new set."]
@@ -1672,6 +1760,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Last scan: {esc(ago(last_scan) if last_scan else 'not yet')}\n"
         f"Last command: {esc(ago(last_cmd) if last_cmd else 'none')}\n"
         f"Scanner: {'running' if context.application.bot_data.get('scan_alive') else 'restarting'}\n"
+        f"Gemini: {esc(KEY_STATUS.get('gemini') or 'not tried')}\n"
+        f"X bearer: {esc(KEY_STATUS.get('x') or 'not tried')} {'set' if env_secret('X_BEARER_TOKEN','TWITTER_BEARER_TOKEN') else 'NOT in env'}\n"
+        f"Gemini env: {'set' if env_secret('GEMINI_API_KEY','GOOGLE_API_KEY','GOOGLE_GEMINI_API_KEY') else 'NOT in env'}\n"
         f"Owner id: {owner[0] if owner else 'will lock on /start'}"
     )
 
@@ -1746,7 +1837,14 @@ async def cmd_early(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"https://x.com/{user}/status/{item.get('tweet_id')}"
             )
     else:
-        lines.append("X search off. Add <code>X_BEARER_TOKEN</code> on Railway for pre-token posts.")
+        xstate = KEY_STATUS.get("x") or "missing"
+        if xstate == "missing":
+            lines.append("X search off — variable <code>X_BEARER_TOKEN</code> is not visible to this service.")
+        else:
+            lines.append(
+                f"X search failed ({esc(xstate)}). Bearer is present but X rejected it "
+                "(wrong token, URL-encoded, or the app has no recent-search access)."
+            )
     if social_first:
         lines += ["", "Token already live but still thin — socials showed up early:"]
         for i, p in enumerate(social_first[:6], 1):
