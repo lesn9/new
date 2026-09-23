@@ -55,6 +55,38 @@ GECKO_CHAIN = {
     "scroll": "scroll", "zksync": "zksync", "mantle": "mantle",
 }
 
+
+CMC_CHAIN_MAP = {
+    "ethereum": "ethereum",
+    "bnb": "bsc",
+    "bnb smart chain (bep20)": "bsc",
+    "binance smart chain": "bsc",
+    "base": "base",
+    "solana": "solana",
+    "polygon": "polygon",
+    "arbitrum": "arbitrum",
+    "optimism": "optimism",
+    "avalanche": "avalanche",
+    "arc": "arc",
+    "arc-token": "arc",
+    "robinhood chain": "robinhood",
+    "robinhood-placeholder": "robinhood",
+    "robinhood": "robinhood",
+    "sui": "sui",
+    "ton": "ton",
+    "cronos": "cronos",
+    "pulsechain": "pulsechain",
+    "ink": "ink",
+    "abstract": "abstract",
+    "hyperevm": "hyperevm",
+    "blast": "blast",
+    "linea": "linea",
+    "scroll": "scroll",
+    "zksync": "zksync",
+    "mantle": "mantle",
+    "sonic": "sonic",
+}
+
 DEFAULT_CHAINS = {
     "solana", "base", "ethereum", "bsc", "abstract", "robinhood", "arc",
     "hyperevm", "sui", "arbitrum", "ink", "monad", "polygon", "ton",
@@ -238,6 +270,7 @@ def parse_lookback(arg: str | None, last_check: int | None) -> tuple[int, str]:
 
 
 def is_qualified(row: dict[str, Any]) -> bool:
+    """True only when a public project identity exists (not contract-only)."""
     return bool(row.get("website") or row.get("twitter") or row.get("telegram") or row.get("discord"))
 
 
@@ -1947,35 +1980,54 @@ def copyable_brief(text: str) -> str:
 
 
 def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
-    label = ", ".join(k.upper() for k in kinds)
+    """Update when more socials appear after the project was already identified."""
     chain = (p.get("chain") or "?").upper()
     kind = classify_project(p)
+    label = ", ".join(k.upper() for k in kinds)
     return (
-        f"📡 <b>SOCIAL SIGNAL ({esc(chain)})</b>\n"
-        f"🪙 {esc(title_of(p))} · {kind['label']}\n"
-        f"Newly visible: <b>{esc(label)}</b>\n"
-        f"⛓ {esc((p.get('chain') or '?').title())}\n"
-        f"🕒 First seen on-chain: {esc(ago(p.get('discovered_at')))}\n"
+        f"🔔 <b>SOCIAL UPDATE ({esc(chain)})</b>\n"
+        f"<b>{esc(title_of(p))}</b> · {kind['label']}\n"
+        f"Newly detected: <b>{esc(label)}</b>\n"
+        f"Contract: <code>{esc(p.get('token_address') or '—')}</code>\n"
         f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
-        f"💬 {mark(p.get('telegram'))}\n"
-        "Project just became socially identifiable."
+        f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}\n"
+        f"First seen: {esc(ago(p.get('discovered_at')))}"
     )
 
 
 def alert_text(p: dict[str, Any]) -> str:
+    """Identity alert: contract + verified social presence. Not a raw deploy ping."""
     s = score_project(p)
     chain = (p.get("chain") or "?").upper()
     kind = classify_project(p)
+    identity = []
+    if p.get("twitter"):
+        identity.append("X")
+    if p.get("telegram"):
+        identity.append("Telegram")
+    if p.get("website"):
+        identity.append("Website")
+    if p.get("discord"):
+        identity.append("Discord")
+    id_line = " + ".join(identity) if identity else "social"
     return (
-        f"🚨 <b>NEW PROJECT DETECTED ({esc(chain)})</b>\n"
-        f"🪙 {esc(title_of(p))} · {kind['label']}\n"
-        f"🎯 {s['band']} {s['score']}/100 · {esc(', '.join(s['roles']))}\n"
+        f"🚨 <b>NEW PROJECT IDENTIFIED ({esc(chain)})</b>\n"
+        f"<b>{esc(title_of(p))}</b> · {kind['label']}\n"
+        f"Identity: <b>{esc(id_line)}</b>\n"
+        f"Contract: <code>{esc(p.get('token_address') or '—')}</code>\n"
         f"⛓ {esc((p.get('chain') or '?').title())}\n"
-        f"🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}\n"
         f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
         f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}\n"
-        f"💧 {esc(money(p.get('liquidity_usd')))} · 📊 {esc(money(p.get('volume_24h')))}"
+        f"First contract/candidate seen: {esc(ago(p.get('discovered_at')))}\n"
+        f"💧 {esc(money(p.get('liquidity_usd')))} · 📊 {esc(money(p.get('volume_24h')))}\n"
+        f"🎯 {s['band']} {s['score']}/100"
     )
+
+
+def has_project_identity(p: dict[str, Any]) -> bool:
+    """Alert gate: real project identity, not bare contract."""
+    return bool(p.get("website") or p.get("twitter") or p.get("telegram") or p.get("discord"))
+
 
 
 # ---------- app helpers ----------
@@ -2093,9 +2145,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await db.ensure_user(update.effective_user.id)
     await update.effective_message.reply_html(
         "🔎 <b>Web3 Project Scout is online.</b>\n\n"
-        "I collect new public-facing projects in the background.\n"
-        "Use /newtokens 12h to see what you missed while offline.\n"
-        "Use /help for commands."
+        "I store early contracts silently.\n"
+        "I only alert when a project identity appears "
+        "(X / Telegram / website).\n\n"
+        "/newtokens 12h — catch up\n"
+        "/watch &lt;CA&gt; — notify when socials appear\n"
+        "/help — all commands"
     )
 
 
@@ -2693,8 +2748,9 @@ async def send_alerts(app: Application) -> None:
         if not user.get("alerts_enabled", 1):
             continue
         for project in await db.alert_candidates(user_id):
-            if score_project(project)["score"] < 45:
-                await db.mark_alerted(user_id, project["id"])
+            # Identity-only gate: qualified already means website/X/TG/discord present.
+            # Never alert on bare contract / liquidity / dex listing alone.
+            if not is_qualified(project):
                 continue
             try:
                 await app.bot.send_message(
@@ -2729,10 +2785,13 @@ async def send_social_alerts(app: Application) -> None:
                 await db.mark_social_alerted(ev["id"])
             continue
         kinds = [e["kind"] for e in evs]
-        if "x" not in kinds and "telegram" not in kinds:
+        # Only notify when real identity channels appear (not random noise)
+        identity_kinds = [k for k in kinds if k in {"x", "telegram", "website", "discord"}]
+        if not identity_kinds:
             for ev in evs:
                 await db.mark_social_alerted(ev["id"])
             continue
+        kinds = identity_kinds
         for user_id in owners:
             user = await db.ensure_user(user_id)
             if not user.get("alerts_enabled", 1):
@@ -2976,16 +3035,17 @@ async def ask_personas_text(p: dict[str, Any], question: str) -> str:
 
 
 async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """CoinGecko trending — only coins that have active public socials (site / X / TG)."""
+    """CoinGecko trending with socials — saved as Scout projects + clickable buttons."""
     if not await gate(update, context) or not update.effective_message:
         return
-    client = context.application.bot_data["http"]
-    await update.effective_message.reply_text("🦎 Scanning CoinGecko trending for projects with active socials…")
+    db, client = deps(context)
+    await update.effective_message.reply_text("🦎 Scanning CoinGecko trending (socials only)…")
     lines = [
         "🦎 <b>COINGECKO · SOCIALS ACTIVE</b>",
-        "Public feed · filtered to website / X / Telegram",
+        "Tap a project below to Investigate / Approach / Gaps",
         "",
     ]
+    saved: list[dict[str, Any]] = []
     try:
         resp = await client.get(
             "https://api.coingecko.com/api/v3/search/trending",
@@ -2993,19 +3053,18 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             headers={"Accept": "application/json"},
         )
         if resp.status_code == 429:
-            await update.effective_message.reply_text("CoinGecko rate limit. Try again in a minute.")
+            await update.effective_message.reply_text("CoinGecko rate limit. Try again shortly.")
             return
         if resp.status_code >= 400:
             await update.effective_message.reply_text(f"CoinGecko HTTP {resp.status_code}")
             return
-        coins = (resp.json().get("coins") or [])[:20]
-        shown = 0
+        coins = (resp.json().get("coins") or [])[:15]
         for item in coins:
             c = item.get("item") or {}
             cid = c.get("id")
             if not cid:
                 continue
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.3)
             detail = await http_get(
                 client,
                 f"https://api.coingecko.com/api/v3/coins/{cid}",
@@ -3020,51 +3079,79 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not isinstance(detail, dict):
                 continue
             links = detail.get("links") or {}
-            homepage = next((u for u in (links.get("homepage") or []) if u), "")
+            homepage = next((u for u in (links.get("homepage") or []) if u), None)
             tw = links.get("twitter_screen_name") or ""
             tg = links.get("telegram_channel_identifier") or ""
-            chat = next((u for u in (links.get("chat_url") or []) if u), "")
-            has_social = bool(homepage or tw or tg or chat)
-            if not has_social:
+            chat = next((u for u in (links.get("chat_url") or []) if u), None)
+            if not (homepage or tw or tg or chat):
                 continue
-            shown += 1
-            tw_url = f"https://x.com/{tw}" if tw else ""
-            tg_url = f"https://t.me/{tg}" if tg else ""
-            lines.append(
-                f"🚨 <b>{esc(c.get('name') or detail.get('name') or '?')}</b> "
-                f"({esc(c.get('symbol') or detail.get('symbol') or '')})\n"
-                f"rank {esc(c.get('market_cap_rank') or '—')} · "
-                f"🌐 {mark(homepage)}  𝕏 {mark(tw_url or None)}  💬 {mark(tg_url or chat or None)}"
-            )
-            if shown >= 10:
+            platforms = detail.get("platforms") or {}
+            # platforms: { "ethereum": "0x...", "solana": "..." }
+            chain, addr = None, None
+            for plat, contract in platforms.items():
+                if not contract:
+                    continue
+                mapped = GECKO_CHAIN.get(plat.lower()) or CMC_CHAIN_MAP.get(plat.lower()) or plat.lower()
+                if mapped in DEFAULT_CHAINS or mapped:
+                    chain, addr = mapped if mapped in DEFAULT_CHAINS else plat.lower(), contract
+                    if chain in DEFAULT_CHAINS:
+                        break
+            if not addr:
+                # no contract — skip (can't investigate as CA project)
+                continue
+            if chain not in DEFAULT_CHAINS:
+                chain = "ethereum" if addr.startswith("0x") else chain
+            proj = {
+                "chain": chain or "ethereum",
+                "token_address": addr,
+                "name": detail.get("name") or c.get("name"),
+                "symbol": detail.get("symbol") or c.get("symbol"),
+                "website": homepage,
+                "twitter": f"https://x.com/{tw}" if tw else None,
+                "telegram": f"https://t.me/{tg}" if tg else (chat if chat and "t.me" in str(chat) else None),
+                "discord": chat if chat and "discord" in str(chat).lower() else None,
+                "source": "coingecko",
+                "qualified": True,
+            }
+            pid, _ = await db.upsert(proj)
+            row = await db.by_id(pid)
+            if row:
+                saved.append(row)
+                lines.append(
+                    f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())}\n"
+                    f"🌐 {mark(row.get('website'))}  𝕏 {mark(row.get('twitter'))}  💬 {mark(row.get('telegram'))}"
+                )
+            if len(saved) >= 10:
                 break
-        if shown == 0:
-            lines.append("No trending coins with public socials right now.")
-        lines.append("")
-        lines.append("Tip: /project &lt;CA&gt; or /watch &lt;CA&gt; to investigate.")
+        if not saved:
+            lines.append("No trending coins with both socials and a contract address right now.")
     except Exception as exc:
         await update.effective_message.reply_text(f"CoinGecko failed: {exc}")
         return
-    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True)
+    markup = list_keyboard(saved, now() - 86400, 0, len(saved)) if saved else None
+    await update.effective_message.reply_html(
+        "\n".join(lines), disable_web_page_preview=True, reply_markup=markup
+    )
 
 
 async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """CMC newest listings — only those with active socials (site / X / chat)."""
+    """CMC newest with socials — upsert contracts + clickable Investigate buttons."""
     if not await gate(update, context) or not update.effective_message:
         return
-    client = context.application.bot_data["http"]
-    await update.effective_message.reply_text("📈 Scanning CMC new listings for active socials…")
+    db, client = deps(context)
+    await update.effective_message.reply_text("📈 Scanning CMC new listings (socials + contract)…")
     lines = [
         "📈 <b>CMC NEW · SOCIALS ACTIVE</b>",
-        "Public feed · newest first · filtered to website / X / chat",
+        "Tap a project to Investigate / Approach / Gaps / Watch",
         "",
     ]
+    saved: list[dict[str, Any]] = []
     try:
         resp = await client.get(
             "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/listing",
             params={
                 "start": 1,
-                "limit": 30,
+                "limit": 25,
                 "sortBy": "date_added",
                 "sortType": "asc",
                 "convert": "USD",
@@ -3085,58 +3172,95 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         items = data.get("cryptoCurrencyList") if isinstance(data, dict) else data
         if not isinstance(items, list):
             items = []
-        shown = 0
         for c in items[:25]:
+            plat = c.get("platform") or {}
+            addr = (plat.get("token_address") or "").strip()
+            if not addr:
+                continue
+            plat_name = (plat.get("name") or plat.get("slug") or "").lower()
+            chain = CMC_CHAIN_MAP.get(plat_name) or CMC_CHAIN_MAP.get((plat.get("slug") or "").lower())
+            if not chain:
+                # fuzzy
+                for key, val in CMC_CHAIN_MAP.items():
+                    if key in plat_name:
+                        chain = val
+                        break
+            if not chain:
+                chain = "ethereum" if addr.startswith("0x") else "solana"
             cid = c.get("id")
-            if not cid:
+            website = twitter = telegram = discord = None
+            if cid:
+                await asyncio.sleep(0.2)
+                detail = await http_get(
+                    client,
+                    "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail",
+                    params={"id": cid},
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "Mozilla/5.0 (compatible; Web3ProjectScout/1.0)",
+                    },
+                )
+                if isinstance(detail, dict):
+                    d = detail.get("data") if isinstance(detail.get("data"), dict) else detail
+                    urls = (d or {}).get("urls") or {}
+                    website = next((u for u in (urls.get("website") or []) if u), None)
+                    twitter = next((u for u in (urls.get("twitter") or []) if u), None)
+                    chats = urls.get("chat") or []
+                    for u in chats:
+                        if not u:
+                            continue
+                        if "t.me" in u:
+                            telegram = u
+                        elif "discord" in u.lower():
+                            discord = u
+                    # platforms fallback for contract
+                    platforms = (d or {}).get("platforms") or []
+                    if platforms and not addr:
+                        addr = platforms[0].get("contractAddress") or addr
+                        chain = CMC_CHAIN_MAP.get((platforms[0].get("contractPlatform") or "").lower(), chain)
+            if not (website or twitter or telegram or discord):
                 continue
-            await asyncio.sleep(0.25)
-            detail = await http_get(
-                client,
-                "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail",
-                params={"id": cid},
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "Mozilla/5.0 (compatible; Web3ProjectScout/1.0)",
-                },
-            )
-            if not isinstance(detail, dict):
-                continue
-            d = detail.get("data") if isinstance(detail.get("data"), dict) else detail
-            urls = (d or {}).get("urls") or {}
-            website = next((u for u in (urls.get("website") or []) if u), "")
-            twitter = next((u for u in (urls.get("twitter") or []) if u), "")
-            chat = next((u for u in (urls.get("chat") or []) if u), "")
-            reddit = next((u for u in (urls.get("reddit") or []) if u), "")
-            # active socials = at least website or twitter or telegram-like chat
-            has_social = bool(website or twitter or chat)
-            if not has_social:
-                continue
-            shown += 1
-            name = c.get("name") or (d or {}).get("name") or "?"
-            sym = c.get("symbol") or (d or {}).get("symbol") or ""
-            added = c.get("dateAdded") or "—"
-            if isinstance(added, str) and "T" in added:
-                added = added.split("T")[0]
             price = None
             quotes = c.get("quotes")
             if isinstance(quotes, list) and quotes:
                 price = quotes[0].get("price")
+            added = c.get("dateAdded") or ""
+            if isinstance(added, str) and "T" in added:
+                added = added.split("T")[0]
+            proj = {
+                "chain": chain,
+                "token_address": addr,
+                "name": c.get("name"),
+                "symbol": c.get("symbol"),
+                "website": website,
+                "twitter": twitter,
+                "telegram": telegram,
+                "discord": discord,
+                "price_usd": price,
+                "source": "cmc",
+                "qualified": True,
+            }
+            pid, _ = await db.upsert(proj)
+            row = await db.by_id(pid)
+            if not row:
+                continue
+            saved.append(row)
             lines.append(
-                f"🚨 <b>{esc(name)}</b> ({esc(sym)})\n"
+                f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())}\n"
                 f"added {esc(added)} · {esc(money(price) if price is not None else '—')}\n"
-                f"🌐 {mark(website)}  𝕏 {mark(twitter or None)}  💬 {mark(chat or reddit or None)}"
+                f"🌐 {mark(row.get('website'))}  𝕏 {mark(row.get('twitter'))}  💬 {mark(row.get('telegram'))}"
             )
-            if shown >= 10:
+            if len(saved) >= 10:
                 break
-        if shown == 0:
-            lines.append("No new CMC listings with public socials in this batch.")
-        lines.append("")
-        lines.append("Tip: /project &lt;CA&gt; or /watch &lt;CA&gt; to monitor.")
+        if not saved:
+            lines.append("No new CMC listings with socials + contract in this batch.")
     except Exception as exc:
         await update.effective_message.reply_text(f"CMC failed: {exc}")
         return
-    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True)
+    markup = list_keyboard(saved, now() - 86400, 0, len(saved)) if saved else None
+    await update.effective_message.reply_html(
+        "\n".join(lines), disable_web_page_preview=True, reply_markup=markup
+    )
 
 
 
