@@ -44,17 +44,22 @@ SKIP_SYMBOLS = {
 GECKO_CHAIN = {
     "eth": "ethereum", "ethereum": "ethereum", "bsc": "bsc", "base": "base",
     "solana": "solana", "arbitrum": "arbitrum", "polygon_pos": "polygon",
-    "avax": "avalanche", "optimism": "optimism", "sui-network": "sui",
-    "sui": "sui", "ton": "ton", "abstract": "abstract", "hyperevm": "hyperevm",
-    "hyperliquid": "hyperevm", "monad": "monad", "ink": "ink",
-    "robinhood": "robinhood", "robinhood-chain": "robinhood",
-    "arc": "arc", "sonic": "sonic", "blast": "blast",
-    "linea": "linea", "berachain": "berachain", "unichain": "unichain",
+    "polygon": "polygon", "avax": "avalanche", "optimism": "optimism",
+    "sui-network": "sui", "sui": "sui", "ton": "ton", "abstract": "abstract",
+    "hyperevm": "hyperevm", "hyperliquid": "hyperevm", "monad": "monad",
+    "ink": "ink", "robinhood": "robinhood", "robinhood-chain": "robinhood",
+    "arc": "arc", "sonic": "sonic", "blast": "blast", "linea": "linea",
+    "berachain": "berachain", "unichain": "unichain", "cronos": "cronos",
+    "pulsechain": "pulsechain", "pulse": "pulsechain", "xrpl": "xrpl",
+    "xrp": "xrpl", "aptos": "aptos", "near": "near", "fantom": "fantom",
+    "scroll": "scroll", "zksync": "zksync", "mantle": "mantle",
 }
 
 DEFAULT_CHAINS = {
-    "solana", "base", "ethereum", "abstract", "robinhood", "arc",
-    "hyperevm", "sui", "arbitrum", "ink", "monad",
+    "solana", "base", "ethereum", "bsc", "abstract", "robinhood", "arc",
+    "hyperevm", "sui", "arbitrum", "ink", "monad", "polygon", "ton",
+    "cronos", "pulsechain", "xrpl", "optimism", "avalanche", "blast",
+    "linea", "scroll", "zksync", "mantle", "sonic", "berachain",
 }
 
 SCHEMA = """
@@ -122,6 +127,7 @@ Finds early public-facing projects and stores them while you sleep.
 /jobs — scored shortlist
 /digest 12h — morning 5
 /approach &lt;id&gt; — tailored comments (X and/or Telegram)
+/ask &lt;id&gt; &lt;question&gt; — persona replies to a TG question
 /early — pre-token / social-first projects
 /watchlist
 /alerts on|off
@@ -1302,6 +1308,35 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
                 if data.get("usd_market_cap") is not None:
                     out["pump_mcap"] = data.get("usd_market_cap")
 
+    # EVM free explorers (Blockscout-style counters) — best-effort
+    blockscout = {
+        "ethereum": "https://eth.blockscout.com",
+        "base": "https://base.blockscout.com",
+        "bsc": "https://bsc.blockscout.com",  # may 404 on some hosts
+        "arbitrum": "https://arbitrum.blockscout.com",
+        "polygon": "https://polygon.blockscout.com",
+        "optimism": "https://optimism.blockscout.com",
+        "gnosis": "https://gnosis.blockscout.com",
+    }
+    if chain in blockscout and not out.get("holders"):
+        base = blockscout[chain]
+        data = await http_get(client, f"{base}/api/v2/tokens/{addr}/counters")
+        if isinstance(data, dict):
+            hc = data.get("token_holders_count") or data.get("holders_count")
+            if hc is not None:
+                try:
+                    out["holders"] = int(str(hc).replace(",", ""))
+                except ValueError:
+                    pass
+        # creator via contract endpoint
+        if not out.get("deployer"):
+            cdata = await http_get(client, f"{base}/api/v2/smart-contracts/{addr}")
+            if isinstance(cdata, dict) and cdata.get("creator_address_hash"):
+                out["deployer"] = cdata["creator_address_hash"]
+            else:
+                # fallback etherscan-style free is key-gated; skip
+                pass
+
     return out
 
 
@@ -1819,9 +1854,11 @@ def copyable_brief(text: str) -> str:
 
 def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
     label = ", ".join(k.upper() for k in kinds)
+    chain = (p.get("chain") or "?").upper()
+    kind = classify_project(p)
     return (
-        "📡 <b>SOCIAL SIGNAL</b>\n"
-        f"🪙 {esc(title_of(p))}\n"
+        f"📡 <b>SOCIAL SIGNAL ({esc(chain)})</b>\n"
+        f"🪙 {esc(title_of(p))} · {kind['label']}\n"
         f"Newly visible: <b>{esc(label)}</b>\n"
         f"⛓ {esc((p.get('chain') or '?').title())}\n"
         f"🕒 First seen on-chain: {esc(ago(p.get('discovered_at')))}\n"
@@ -1833,9 +1870,11 @@ def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
 
 def alert_text(p: dict[str, Any]) -> str:
     s = score_project(p)
+    chain = (p.get("chain") or "?").upper()
+    kind = classify_project(p)
     return (
-        "🚨 <b>NEW PROJECT DETECTED</b>\n"
-        f"🪙 {esc(title_of(p))}\n"
+        f"🚨 <b>NEW PROJECT DETECTED ({esc(chain)})</b>\n"
+        f"🪙 {esc(title_of(p))} · {kind['label']}\n"
         f"🎯 {s['band']} {s['score']}/100 · {esc(', '.join(s['roles']))}\n"
         f"⛓ {esc((p.get('chain') or '?').title())}\n"
         f"🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}\n"
@@ -2326,25 +2365,66 @@ async def discovery_once(app: Application) -> None:
     db: DB = app.bot_data["db"]
     client: httpx.AsyncClient = app.bot_data["http"]
 
-    profiles = await http_get(client, f"{DEX_API}/token-profiles/latest/v1")
-    if isinstance(profiles, list):
-        for raw in profiles:
-            parsed = parse_profile(raw)
-            if parsed.get("chain") in DEFAULT_CHAINS and parsed.get("token_address"):
-                await db.upsert(parsed)
+    # DexScreener profiles (latest + recent updates) — multi-chain
+    for path in ("token-profiles/latest/v1", "token-profiles/recent-updates/v1"):
+        profiles = await http_get(client, f"{DEX_API}/{path}")
+        if isinstance(profiles, list):
+            for raw in profiles:
+                parsed = parse_profile(raw)
+                if parsed.get("chain") in DEFAULT_CHAINS and parsed.get("token_address"):
+                    await db.upsert(parsed)
 
-    gecko = await http_get(
-        client,
-        f"{GECKO_API}/networks/new_pools",
-        params={"page": 1, "include": "base_token,quote_token,network,dex"},
-        headers={"Accept": "application/json"},
-    )
-    if isinstance(gecko, dict):
-        for parsed in parse_gecko(gecko):
-            if parsed.get("chain") in DEFAULT_CHAINS:
-                await db.upsert(parsed)
+    # Boosted tokens sometimes include non-Solana early
+    boosted = await http_get(client, f"{DEX_API}/token-boosts/latest/v1")
+    if isinstance(boosted, list):
+        for raw in boosted:
+            chain = (raw.get("chainId") or "").lower()
+            addr = raw.get("tokenAddress") or ""
+            if chain in DEFAULT_CHAINS and addr:
+                await db.upsert({
+                    "chain": chain,
+                    "token_address": addr,
+                    "source": "dex-boost",
+                    "qualified": False,
+                })
 
-    rows = await db.unenriched(12)
+    # GeckoTerminal per-network new pools — spreads coverage beyond Solana
+    gecko_networks = [
+        ("solana", "solana"),
+        ("eth", "ethereum"),
+        ("base", "base"),
+        ("bsc", "bsc"),
+        ("arbitrum", "arbitrum"),
+        ("polygon_pos", "polygon"),
+        ("sui-network", "sui"),
+        ("ton", "ton"),
+        ("ink", "ink"),
+        ("abstract", "abstract"),
+        ("hyperevm", "hyperevm"),
+        ("cronos", "cronos"),
+        ("optimism", "optimism"),
+        ("avax", "avalanche"),
+        ("blast", "blast"),
+        ("linea", "linea"),
+        ("scroll", "scroll"),
+        ("sonic", "sonic"),
+        ("monad", "monad"),
+    ]
+    for network_id, _chain in gecko_networks:
+        gecko = await http_get(
+            client,
+            f"{GECKO_API}/networks/{network_id}/new_pools",
+            params={"page": 1, "include": "base_token,quote_token,network,dex"},
+            headers={"Accept": "application/json"},
+        )
+        if isinstance(gecko, dict):
+            for parsed in parse_gecko(gecko):
+                if parsed.get("chain") in DEFAULT_CHAINS:
+                    await db.upsert(parsed)
+        await asyncio.sleep(0.25)
+
+    # Enrich a batch
+    rows = await db.unenriched(16)
     by_chain: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         by_chain.setdefault(row["chain"], []).append(row)
@@ -2454,7 +2534,7 @@ async def discovery_loop(app: Application) -> None:
             last_cmd = int(app.bot_data.get("last_command_at") or 0)
             busy = last_cmd and (now() - last_cmd) < 30
             last_scan = int(app.bot_data.get("last_scan_at") or 0)
-            due = (now() - last_scan) >= int(os.getenv("DISCOVERY_INTERVAL_SEC", "90"))
+            due = (now() - last_scan) >= int(os.getenv("DISCOVERY_INTERVAL_SEC", "30"))
             idle_kick = last_cmd and (now() - last_cmd) >= 30 and (now() - last_scan) >= 30
             if (due or idle_kick or not last_scan) and not busy:
                 await discovery_once(app)
@@ -2462,7 +2542,7 @@ async def discovery_loop(app: Application) -> None:
                 log.info("discovery cycle ok")
         except Exception:
             log.exception("discovery cycle failed")
-        await asyncio.sleep(8)
+        await asyncio.sleep(4)
 
 
 async def note_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2492,6 +2572,83 @@ async def on_stop(app: Application) -> None:
     db = app.bot_data.get("db")
     if db:
         await db.close()
+
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask the AI for persona replies to a community question.
+    Usage: /ask <project_id> <your question or paste from TG>
+    """
+    if not await gate(update, context) or not update.effective_message:
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.effective_message.reply_text(
+            "Usage:\\n/ask <project_id> <question or paste from their TG>\\n\\n"
+            "Example:\\n/ask 42 how does staking work?"
+        )
+        return
+    try:
+        pid = int(args[0])
+    except ValueError:
+        await update.effective_message.reply_text("First argument must be a project id number.")
+        return
+    question = " ".join(args[1:]).strip()
+    if not question:
+        await update.effective_message.reply_text("Add a question after the project id.")
+        return
+    db, client = deps(context)
+    project = await db.by_id(pid)
+    if not project:
+        await update.effective_message.reply_text("Unknown project id. Use /jobs or /project first.")
+        return
+    project = await enrich_one(db, client, project, context.bot)
+    text = await ask_personas_text(project, question)
+    await update.effective_message.reply_html(
+        text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
+    )
+
+
+async def ask_personas_text(p: dict[str, Any], question: str) -> str:
+    s = score_project(p)
+    comm = community(p)
+    what = p.get("description") or comm.get("site_about") or comm.get("tg_about") or "Thin public description."
+    kind = classify_project(p)
+    prompt = (
+        f"Project: {title_of(p)}\\nChain: {p.get('chain')}\\nType: {kind['label']}\\n"
+        f"Website: {p.get('website')}\\nX: {p.get('twitter')}\\nTelegram: {p.get('telegram')}\\n"
+        f"About: {what}\\n"
+        f"Community question (from chat or user):\\n{question}\\n\\n"
+        f"Write reply options a community operator could post. "
+        f"Use these labels exactly, each 1-2 sentences, human, specific to THIS product:\\n"
+        f"CURIOUS\\nINVESTOR\\nSUGGESTION\\nQUESTION\\nSUPPORTER\\nSTRATEGIST\\nRANDOM\\n"
+        f"No hashtags dump. No investment advice. Variation seed {random.randint(1,9999)}."
+    )
+    generated = await llm_write(prompt)
+    header = [
+        "🗣 <b>PERSONA REPLIES</b>",
+        f"<b>{esc(title_of(p))}</b> · {kind['label']} · {s['band']} {s['score']}/100",
+        f"⛓ {esc((p.get('chain') or '?').title())}",
+        "",
+        "❓ <b>Question</b>",
+        f"<i>{esc(question)[:500]}</i>",
+        "",
+    ]
+    if generated:
+        body = [copyable_brief(generated)]
+    else:
+        body = [
+            f"⚠️ AI offline · {esc(KEY_STATUS.get('groq') or KEY_STATUS.get('openrouter') or KEY_STATUS.get('gemini') or 'no key')}",
+            "",
+            "<b>CURIOUS</b>",
+            f"<code>Good question. From what I read about {esc(title_of(p))}, the public copy is still thin — does the team have a short FAQ for this?</code>",
+            "<b>SUGGESTION</b>",
+            "<code>Pin a 3-line answer in the chat so the same question stops looping.</code>",
+            "<b>QUESTION</b>",
+            "<code>Is this answered in docs, or only in voice chats / AMAs?</code>",
+        ]
+    return "\\n".join(header + body + ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}"])
+
 
 
 def main() -> None:
@@ -2524,6 +2681,7 @@ def main() -> None:
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("approach", cmd_approach))
     app.add_handler(CommandHandler("early", cmd_early))
+    app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(cb_newtokens, pattern=r"^nt:"))
     app.add_handler(CallbackQueryHandler(cb_investigate, pattern=r"^inv:"))
