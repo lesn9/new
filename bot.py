@@ -2041,6 +2041,16 @@ async def enrich_one(db: DB, client: httpx.AsyncClient, project: dict[str, Any],
     return fresh
 
 
+async def resolve_id_or_ca(db: DB, client: httpx.AsyncClient, query: str, bot=None) -> dict[str, Any] | None:
+    """Accept project id OR contract address (with optional chain: prefix)."""
+    q = (query or "").strip()
+    if not q:
+        return None
+    if q.isdigit():
+        return await db.by_id(int(q))
+    return await resolve_project(db, client, q, bot)
+
+
 async def resolve_project(db: DB, client: httpx.AsyncClient, query: str, bot=None) -> dict[str, Any] | None:
     query = query.strip()
     chain = None
@@ -2232,11 +2242,15 @@ async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await gate(update, context) or not update.effective_message or not update.effective_user:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /unwatch <id>")
+        await update.effective_message.reply_text("Usage: /unwatch <id|CA>")
         return
-    db, _ = deps(context)
-    await db.unwatch(update.effective_user.id, int(context.args[0]))
-    await update.effective_message.reply_text("Removed.")
+    db, client = deps(context)
+    project = await resolve_id_or_ca(db, client, " ".join(context.args), context.bot)
+    if not project:
+        await update.effective_message.reply_text("Could not resolve id/CA.")
+        return
+    await db.unwatch(update.effective_user.id, int(project["id"]))
+    await update.effective_message.reply_html(f"Removed #{project['id']} {esc(title_of(project))}.")
 
 
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2325,18 +2339,19 @@ async def cmd_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /approach <project_id>   or tap Approach brief on a report.")
+        await update.effective_message.reply_text("Usage: /approach <project_id|CA|chain:CA>")
         return
     db, client = deps(context)
-    project = await db.by_id(int(context.args[0]))
+    project = await resolve_id_or_ca(db, client, " ".join(context.args), context.bot)
     if not project:
-        await update.effective_message.reply_text("Unknown project id. Use /jobs first.")
+        await update.effective_message.reply_text("Could not resolve id/CA. Try /project <CA> first.")
         return
     project = await enrich_one(db, client, project, context.bot)
     text = await approach_text(project)
     await update.effective_message.reply_html(
         text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
     )
+
 
 
 async def cb_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2792,21 +2807,19 @@ async def cmd_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /gaps <project_id>   or /gaps <CA>")
+        await update.effective_message.reply_text("Usage: /gaps <project_id|CA|chain:CA>")
         return
     db, client = deps(context)
-    query = " ".join(context.args).strip()
-    project = await db.by_id(int(query)) if query.isdigit() else None
+    project = await resolve_id_or_ca(db, client, " ".join(context.args), context.bot)
     if not project:
-        project = await resolve_project(db, client, query, context.bot)
-    if not project:
-        await update.effective_message.reply_text("Project not found.")
+        await update.effective_message.reply_text("Could not resolve id/CA.")
         return
     project = await enrich_one(db, client, project, context.bot)
     text = await gaps_text(project)
     await update.effective_message.reply_html(
         text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
     )
+
 
 
 async def gaps_text(p: dict[str, Any]) -> str:
@@ -2878,37 +2891,45 @@ async def gaps_text(p: dict[str, Any]) -> str:
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ask the AI for persona replies to a community question.
-    Usage: /ask <project_id> <your question or paste from TG>
+    """Ask the AI for persona replies.
+    Usage: /ask <id|CA> <question>
     """
     if not await gate(update, context) or not update.effective_message:
         return
     args = context.args or []
     if len(args) < 2:
         await update.effective_message.reply_text(
-            "Usage:\\n/ask <project_id> <question or paste from their TG>\\n\\n"
-            "Example:\\n/ask 42 how does staking work?"
+            "Usage:\n/ask <project_id|CA> <question>\n\n"
+            "Example:\n/ask 42 how does staking work?\n/ask 0xabc... is the product live?"
         )
         return
-    try:
-        pid = int(args[0])
-    except ValueError:
-        await update.effective_message.reply_text("First argument must be a project id number.")
-        return
-    question = " ".join(args[1:]).strip()
-    if not question:
-        await update.effective_message.reply_text("Add a question after the project id.")
-        return
     db, client = deps(context)
-    project = await db.by_id(pid)
+    # first token may be id, CA, or chain:CA — rest is question
+    # if chain:CA form, first arg is full query
+    first = args[0]
+    if ":" in first and not first.isdigit():
+        query = first
+        question = " ".join(args[1:]).strip()
+    elif first.isdigit() or len(first) >= 20:
+        query = first
+        question = " ".join(args[1:]).strip()
+    else:
+        # ambiguous — try whole as CA only if one arg left
+        query = first
+        question = " ".join(args[1:]).strip()
+    if not question:
+        await update.effective_message.reply_text("Add a question after the id/CA.")
+        return
+    project = await resolve_id_or_ca(db, client, query, context.bot)
     if not project:
-        await update.effective_message.reply_text("Unknown project id. Use /jobs or /project first.")
+        await update.effective_message.reply_text("Could not resolve id/CA. Use /project first.")
         return
     project = await enrich_one(db, client, project, context.bot)
     text = await ask_personas_text(project, question)
     await update.effective_message.reply_html(
         text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
     )
+
 
 
 async def ask_personas_text(p: dict[str, Any], question: str) -> str:
@@ -2955,13 +2976,14 @@ async def ask_personas_text(p: dict[str, Any], question: str) -> str:
 
 
 async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """CoinGecko trending — public, no key required."""
+    """CoinGecko trending — only coins that have active public socials (site / X / TG)."""
     if not await gate(update, context) or not update.effective_message:
         return
     client = context.application.bot_data["http"]
+    await update.effective_message.reply_text("🦎 Scanning CoinGecko trending for projects with active socials…")
     lines = [
-        "🦎 <b>COINGECKO TRENDING</b>",
-        "Public endpoint · no API key required",
+        "🦎 <b>COINGECKO · SOCIALS ACTIVE</b>",
+        "Public feed · filtered to website / X / Telegram",
         "",
     ]
     try:
@@ -2971,25 +2993,55 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             headers={"Accept": "application/json"},
         )
         if resp.status_code == 429:
-            await update.effective_message.reply_text(
-                "CoinGecko rate limit (public pool). Try again in a minute."
-            )
+            await update.effective_message.reply_text("CoinGecko rate limit. Try again in a minute.")
             return
         if resp.status_code >= 400:
             await update.effective_message.reply_text(f"CoinGecko HTTP {resp.status_code}")
             return
-        data = resp.json()
-        coins = data.get("coins") or []
-        if not coins:
-            lines.append("No trending coins returned.")
-        for i, item in enumerate(coins[:15], 1):
+        coins = (resp.json().get("coins") or [])[:20]
+        shown = 0
+        for item in coins:
             c = item.get("item") or {}
-            lines.append(
-                f"{i}. <b>{esc(c.get('name') or '?')}</b> ({esc(c.get('symbol') or '')})\n"
-                f"rank {esc(c.get('market_cap_rank') or '—')} · score {esc(c.get('score'))}"
+            cid = c.get("id")
+            if not cid:
+                continue
+            await asyncio.sleep(0.35)
+            detail = await http_get(
+                client,
+                f"https://api.coingecko.com/api/v3/coins/{cid}",
+                params={
+                    "localization": "false",
+                    "tickers": "false",
+                    "market_data": "false",
+                    "community_data": "true",
+                    "developer_data": "false",
+                },
             )
+            if not isinstance(detail, dict):
+                continue
+            links = detail.get("links") or {}
+            homepage = next((u for u in (links.get("homepage") or []) if u), "")
+            tw = links.get("twitter_screen_name") or ""
+            tg = links.get("telegram_channel_identifier") or ""
+            chat = next((u for u in (links.get("chat_url") or []) if u), "")
+            has_social = bool(homepage or tw or tg or chat)
+            if not has_social:
+                continue
+            shown += 1
+            tw_url = f"https://x.com/{tw}" if tw else ""
+            tg_url = f"https://t.me/{tg}" if tg else ""
+            lines.append(
+                f"🚨 <b>{esc(c.get('name') or detail.get('name') or '?')}</b> "
+                f"({esc(c.get('symbol') or detail.get('symbol') or '')})\n"
+                f"rank {esc(c.get('market_cap_rank') or '—')} · "
+                f"🌐 {mark(homepage)}  𝕏 {mark(tw_url or None)}  💬 {mark(tg_url or chat or None)}"
+            )
+            if shown >= 10:
+                break
+        if shown == 0:
+            lines.append("No trending coins with public socials right now.")
         lines.append("")
-        lines.append("Tip: /project &lt;CA&gt; to investigate a contract.")
+        lines.append("Tip: /project &lt;CA&gt; or /watch &lt;CA&gt; to investigate.")
     except Exception as exc:
         await update.effective_message.reply_text(f"CoinGecko failed: {exc}")
         return
@@ -2997,13 +3049,14 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """CoinMarketCap newest listings — public data-api, no key required."""
+    """CMC newest listings — only those with active socials (site / X / chat)."""
     if not await gate(update, context) or not update.effective_message:
         return
     client = context.application.bot_data["http"]
+    await update.effective_message.reply_text("📈 Scanning CMC new listings for active socials…")
     lines = [
-        "📈 <b>COINMARKETCAP NEW LISTINGS</b>",
-        "Public endpoint · sorted by date added · no API key required",
+        "📈 <b>CMC NEW · SOCIALS ACTIVE</b>",
+        "Public feed · newest first · filtered to website / X / chat",
         "",
     ]
     try:
@@ -3011,7 +3064,7 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/listing",
             params={
                 "start": 1,
-                "limit": 15,
+                "limit": 30,
                 "sortBy": "date_added",
                 "sortType": "asc",
                 "convert": "USD",
@@ -3025,45 +3078,61 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             },
         )
         if resp.status_code >= 400:
-            # fallback public pro path
-            resp = await client.get(
-                "https://pro-api.coinmarketcap.com/public-api/v3/cryptocurrency/listings/latest",
-                params={"start": 1, "limit": 15, "convert": "USD"},
-                timeout=20,
-            )
-        if resp.status_code >= 400:
             await update.effective_message.reply_text(f"CMC HTTP {resp.status_code}")
             return
         payload = resp.json()
-        data = payload.get("data")
-        items: list[dict[str, Any]] = []
-        if isinstance(data, dict) and "cryptoCurrencyList" in data:
-            items = data.get("cryptoCurrencyList") or []
-        elif isinstance(data, list):
-            items = data
-        for i, c in enumerate(items[:12], 1):
-            name = c.get("name") or "?"
-            sym = c.get("symbol") or ""
-            added = c.get("dateAdded") or c.get("date_added") or "—"
+        data = payload.get("data") or {}
+        items = data.get("cryptoCurrencyList") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            items = []
+        shown = 0
+        for c in items[:25]:
+            cid = c.get("id")
+            if not cid:
+                continue
+            await asyncio.sleep(0.25)
+            detail = await http_get(
+                client,
+                "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail",
+                params={"id": cid},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (compatible; Web3ProjectScout/1.0)",
+                },
+            )
+            if not isinstance(detail, dict):
+                continue
+            d = detail.get("data") if isinstance(detail.get("data"), dict) else detail
+            urls = (d or {}).get("urls") or {}
+            website = next((u for u in (urls.get("website") or []) if u), "")
+            twitter = next((u for u in (urls.get("twitter") or []) if u), "")
+            chat = next((u for u in (urls.get("chat") or []) if u), "")
+            reddit = next((u for u in (urls.get("reddit") or []) if u), "")
+            # active socials = at least website or twitter or telegram-like chat
+            has_social = bool(website or twitter or chat)
+            if not has_social:
+                continue
+            shown += 1
+            name = c.get("name") or (d or {}).get("name") or "?"
+            sym = c.get("symbol") or (d or {}).get("symbol") or ""
+            added = c.get("dateAdded") or "—"
             if isinstance(added, str) and "T" in added:
                 added = added.split("T")[0]
             price = None
             quotes = c.get("quotes")
             if isinstance(quotes, list) and quotes:
                 price = quotes[0].get("price")
-            elif isinstance(quotes, dict):
-                price = (quotes.get("USD") or {}).get("price")
-            q = c.get("quote") or {}
-            if price is None and isinstance(q, dict):
-                price = (q.get("USD") or {}).get("price")
             lines.append(
-                f"{i}. <b>{esc(name)}</b> ({esc(sym)})\n"
-                f"added {esc(added)} · {esc(money(price) if price is not None else '—')}"
+                f"🚨 <b>{esc(name)}</b> ({esc(sym)})\n"
+                f"added {esc(added)} · {esc(money(price) if price is not None else '—')}\n"
+                f"🌐 {mark(website)}  𝕏 {mark(twitter or None)}  💬 {mark(chat or reddit or None)}"
             )
-        if not items:
-            lines.append("No rows returned.")
+            if shown >= 10:
+                break
+        if shown == 0:
+            lines.append("No new CMC listings with public socials in this batch.")
         lines.append("")
-        lines.append("Tip: /project &lt;CA&gt; after you find a contract on-chain.")
+        lines.append("Tip: /project &lt;CA&gt; or /watch &lt;CA&gt; to monitor.")
     except Exception as exc:
         await update.effective_message.reply_text(f"CMC failed: {exc}")
         return
