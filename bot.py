@@ -17,7 +17,7 @@ from urllib.parse import unquote
 import aiosqlite
 import httpx
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -145,6 +145,8 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 );
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
+
+SCOUT_BUILD = "2026-09-23-risks-mcap-tg-v1"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -609,7 +611,7 @@ class DB:
               AND p.id NOT IN (SELECT project_id FROM alerts_sent WHERE user_id=?)
             ORDER BY p.discovered_at DESC LIMIT ?
             """,
-            (now() - 6 * 3600, user_id, limit),
+            (now() - 48 * 3600, user_id, limit),
         )
         return [dict(r) for r in await cur.fetchall()]
 
@@ -1482,30 +1484,24 @@ def classify_project(p: dict[str, Any]) -> dict[str, Any]:
         "ai ", " artificial", "agent", "infra", "protocol", "defi", "lend", "borrow",
         "stake", "staking", "yield", "swap", "dex", "bridge", "oracle", "layer",
         "l2", "rollup", "zk", "privacy", "identity", "wallet", "sdk", "api ",
-        "tool", "platform", "marketplace", "nft utility", "gamefi", "play to earn",
-        "rwa", "real world", "payment", "payfi", "compute", "storage", "data ",
-        "governance", "dao", "launchpad", "restake", "liquid staking", "perps",
-        "perpetual", "derivatives", "options", "insurance", "prediction",
-        "socialfi", "creator economy", "subscription", "saas", "b2b", "enterprise",
+        "tool", "platform", "marketplace", "gamefi", "rwa", "payment", "compute",
+        "governance", "dao", "launchpad", "restake", "perps", "insurance",
         "testnet", "mainnet", "docs", "whitepaper", "roadmap", "utility token",
     ]
     meme_kw = [
         "meme", "pepe", "doge", "wojak", "chad", "based", "only up", "moon",
         "pump", "to the moon", "community coin", "fair launch", "no utility",
         "just a meme", "culture", "vibes", "funny", "cat coin", "dog coin",
-        "frog", "inu ", "shiba", "elon", "trump", "maga", "animal",
-        "mascot", "ticker", "cto", "community take over",
+        "frog", "inu ", "shiba", "elon", "trump", "maga", "mascot", "cto",
+        "community take over",
     ]
 
     u_hits = sum(1 for k in utility_kw if k in blob)
     m_hits = sum(1 for k in meme_kw if k in blob)
-
     has_docs = bool(p.get("docs"))
     has_site = bool(p.get("website"))
     has_desc = len(desc) > 60
     long_product = any(x in blob for x in ("how it works", "use case", "product", "users can", "built for"))
-
-    # structural signals
     if has_docs:
         u_hits += 3
     if has_site and has_desc:
@@ -1514,27 +1510,21 @@ def classify_project(p: dict[str, Any]) -> dict[str, Any]:
         u_hits += 2
     if not has_site and not has_docs and len(desc) < 30:
         m_hits += 2
-    # pure ticker / animal names without product language
     if m_hits >= 2 and u_hits == 0:
         m_hits += 1
 
-    if u_hits >= 3 and u_hits > m_hits:
-        kind = "utility"
-        label = "🔧 Utility"
-    elif m_hits >= 2 and m_hits >= u_hits:
-        kind = "meme"
-        label = "🐸 Meme"
-    elif u_hits >= 1 and has_docs:
-        kind = "utility"
-        label = "🔧 Utility"
-    elif u_hits == 0 and m_hits == 0 and not has_docs and not has_desc:
-        kind = "meme"
-        label = "🐸 Likely meme"
-    else:
-        kind = "mixed"
-        label = "⚖️ Mixed / unclear"
+    if m_hits >= u_hits + 2 or (m_hits >= 2 and u_hits <= 1 and not has_docs):
+        return {"label": "🐸 Meme", "type": "meme"}
+    if u_hits >= m_hits + 2 or (has_docs and u_hits >= 1):
+        return {"label": "🔧 Utility", "type": "utility"}
+    if u_hits > 0 and m_hits > 0:
+        return {"label": "⚖️ Mixed", "type": "mixed"}
+    if has_site and has_desc:
+        return {"label": "🔧 Utility", "type": "utility"}
+    if not has_site and not has_docs:
+        return {"label": "🐸 Meme", "type": "meme"}
+    return {"label": "⚖️ Mixed", "type": "mixed"}
 
-    return {"kind": kind, "label": label, "utility_hits": u_hits, "meme_hits": m_hits}
 
 
 def score_project(p: dict[str, Any]) -> dict[str, Any]:
@@ -1701,21 +1691,31 @@ def list_keyboard(projects: list[dict[str, Any]], since_ts: int, offset: int, to
 
 
 def report_text(p: dict[str, Any]) -> str:
+    """Clean project intelligence dashboard."""
     what = p.get("description") or "No public description indexed yet."
     s = score_project(p)
     comm = community(p)
+    kind = classify_project(p)
+    badge = source_label(p)
     lines = [
         "🧠 <b>PROJECT INTELLIGENCE</b>",
         f"<b>{esc(title_of(p))}</b>",
+        f"{kind['label']}" + (f" · {badge}" if badge else ""),
         f"⛓ {(p.get('chain') or '?').title()}",
+        f"🏷 <code>{esc(p.get('token_address') or '')}</code>",
         f"🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}",
-        f"🎯 Opportunity: <b>{s['band']}</b> {s['score']}/100",
-        f"{classify_project(p)['label']} · {source_label(p)}",
-        f"🏷 CA: <code>{esc(p.get('token_address') or '')}</code>",
-        f"🕒 First stored: {esc(ago(p.get('discovered_at')))}",
+        f"🎯 {s['band']} {s['score']}/100",
+        "",
+        "💰 <b>MARKET</b>",
+        f"MCAP: <b>{esc(money(p.get('market_cap')))}</b>",
+        f"FDV: {esc(money(p.get('fdv')))}",
+        f"Liquidity: {esc(money(p.get('liquidity_usd')))}",
+        f"Volume 24h: {esc(money(p.get('volume_24h')))}",
+        f"Price: {esc(money(p.get('price_usd')))}",
+        f"DEX: {esc(p.get('dex') or '—')}",
         "",
         "🎯 <b>WHAT THEY BUILD</b>",
-        esc(what)[:700],
+        esc(str(what)[:700]),
         "",
         "🌐 <b>PRESENCE</b>",
         f"Website: {esc(p.get('website') or '—')}",
@@ -1724,61 +1724,28 @@ def report_text(p: dict[str, Any]) -> str:
         f"Discord: {esc(p.get('discord') or '—')}",
         f"Docs: {esc(p.get('docs') or '—')}",
         "",
-        "⛓ <b>ON-CHAIN</b>",
+        "⛓ <b>ON-CHAIN SNAPSHOT</b>",
     ]
-    deployer = comm.get("deployer")
-    holders = comm.get("holders")
-    if deployer:
-        lines.append(f"Deployer / creator: <code>{esc(deployer)}</code>")
+    if comm.get("deployer"):
+        lines.append(f"Deployer: <code>{esc(comm.get('deployer'))}</code>")
     else:
-        lines.append("Deployer / creator: —")
-    if holders is not None:
-        lines.append(f"Holders: <b>{esc(holders)}</b>")
+        lines.append("Deployer: —")
+    if comm.get("holders") is not None:
+        lines.append(f"Holders: <b>{esc(comm.get('holders'))}</b>")
     else:
-        lines.append("Holders: — (free source only for some Solana launches)")
-    if comm.get("pump_complete") is not None:
-        lines.append(f"Pump.fun graduated: {'yes' if comm.get('pump_complete') else 'no'}")
-    if comm.get("pump_mcap") is not None:
-        lines.append(f"Pump mcap: {esc(money(to_float(comm.get('pump_mcap'))))}")
-    lines += ["", "👥 <b>COMMUNITY</b>"]
-    if comm.get("tg_title") or comm.get("tg_members"):
-        lines.append(
-            f"TG: {esc(comm.get('tg_title') or 'public chat')} · "
-            f"{esc(comm.get('tg_members') or '—')} members"
-        )
-        if comm.get("tg_about"):
-            lines.append(esc(comm["tg_about"])[:220])
-    if comm.get("dc_name") or comm.get("dc_members"):
-        lines.append(
-            f"Discord: {esc(comm.get('dc_name') or 'server')} · "
-            f"{esc(comm.get('dc_members') or '—')} members"
-            + (f" · {esc(comm.get('dc_online'))} online" if comm.get("dc_online") else "")
-        )
-    if comm.get("site_title"):
-        lines.append(f"Site: {esc(comm.get('site_title'))}")
-    if comm.get("site_about"):
-        lines.append(esc(comm["site_about"])[:220])
-    if comm.get("x_handle"):
-        lines.append(f"X: @{esc(comm['x_handle'])}")
-    if not any(comm.get(k) for k in ("tg_members", "dc_members", "site_title", "tg_title", "deployer", "holders")):
-        lines.append("No public community / on-chain stats yet. Tap Refresh.")
+        lines.append("Holders: —")
+    if comm.get("rugcheck_score") is not None:
+        lines.append(f"Rugcheck: {esc(comm.get('rugcheck_score'))}")
+    if comm.get("rugged"):
+        lines.append("⚠️ Flagged rugged by rugcheck")
     lines += [
         "",
-        "📊 <b>MARKET</b>",
-        f"Liquidity: {esc(money(p.get('liquidity_usd')))}",
-        f"Volume 24h: {esc(money(p.get('volume_24h')))}",
-        f"FDV: {esc(money(p.get('fdv')))}",
-        f"DEX: {esc(p.get('dex') or '—')}",
-        "",
-        "⚠️ <b>OBSERVATIONS</b>",
+        "👉 <b>NEXT</b>",
+        esc(s.get("action") or "Review gaps + risks, then decide approach."),
+        f"Roles: {esc(', '.join(s.get('roles') or []))}",
     ]
-    for item in observations_for(p):
-        lines.append(f"• {esc(item)}")
-    lines += ["", "💼 <b>POTENTIAL OPPORTUNITY</b>", f"Roles: {esc(', '.join(s['roles']))}"]
-    for item in opportunity_signals(p):
-        lines.append(f"• {esc(item)}")
-    lines += ["", "👉 <b>NEXT MOVE</b>", esc(s["action"])]
     return "\n".join(lines)
+
 
 
 def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
@@ -1795,6 +1762,9 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("⛓ On-chain", callback_data=f"oc:{pid}"),
             InlineKeyboardButton("🔍 Gaps", callback_data=f"gp:{pid}"),
+        ],
+        [
+            InlineKeyboardButton("⚠️ Risks", callback_data=f"rk:{pid}"),
         ],
     ]
     links: list[InlineKeyboardButton] = []
@@ -1818,43 +1788,90 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 def onchain_text(p: dict[str, Any]) -> str:
-    """Focused on-chain view for the On-chain button."""
+    """On-chain dashboard with risks + constructive suggestions."""
     comm = community(p)
     s = score_project(p)
+    kind = classify_project(p)
+    liq = float(p.get("liquidity_usd") or 0)
+    vol = float(p.get("volume_24h") or 0)
+    mcap = p.get("market_cap")
+    holders = comm.get("holders")
     lines = [
         "⛓ <b>ON-CHAIN ANALYSIS</b>",
-        f"<b>{esc(title_of(p))}</b>",
+        f"<b>{esc(title_of(p))}</b> · {kind['label']}",
         f"⛓ {(p.get('chain') or '?').title()}",
-        f"🏷 CA: <code>{esc(p.get('token_address') or '')}</code>",
+        f"🏷 <code>{esc(p.get('token_address') or '')}</code>",
         "",
-        f"Deployer / creator: <code>{esc(comm.get('deployer') or '—')}</code>",
-        f"Holders: <b>{esc(comm.get('holders') if comm.get('holders') is not None else '—')}</b>",
+        "💰 <b>MARKET</b>",
+        f"MCAP: <b>{esc(money(mcap))}</b>",
+        f"FDV: {esc(money(p.get('fdv')))}",
+        f"Liquidity: {esc(money(liq))}",
+        f"Volume 24h: {esc(money(vol))}",
+        f"Price: {esc(money(p.get('price_usd')))}",
+        f"DEX: {esc(p.get('dex') or '—')}",
+        "",
+        "👤 <b>CREATOR / HOLDERS</b>",
+        f"Deployer: <code>{esc(comm.get('deployer') or '—')}</code>",
+        f"Holders: <b>{esc(holders if holders is not None else '—')}</b>",
     ]
     if comm.get("pump_complete") is not None:
         lines.append(f"Pump.fun graduated: {'yes' if comm.get('pump_complete') else 'no'}")
     if comm.get("pump_mcap") is not None:
         lines.append(f"Pump mcap: {esc(money(to_float(comm.get('pump_mcap'))))}")
     if comm.get("rugcheck_score") is not None:
-        lines.append(f"Rugcheck score: {esc(comm.get('rugcheck_score'))} (lower is safer)")
+        lines.append(f"Rugcheck score: {esc(comm.get('rugcheck_score'))} (lower usually safer)")
     if comm.get("rugged"):
         lines.append("⚠️ Rugcheck flagged rugged")
-    kind = classify_project(p)
-    lines.append(f"Type: {kind['label']}")
+
+    lines += ["", "⚠️ <b>ON-CHAIN RISK SIGNALS</b>"]
+    risks = []
+    if liq and liq < 3000:
+        risks.append("Very thin liquidity — easy to move price; exit risk high.")
+    elif liq and liq < 15000:
+        risks.append("Modest liquidity — size entries carefully.")
+    if vol and liq and vol > liq * 5:
+        risks.append("Volume >> liquidity — possible wash or aggressive churn.")
+    if holders is not None and holders < 50:
+        risks.append(f"Low holder count ({holders}) — concentration / early distribution risk.")
+    elif holders is not None and holders < 200:
+        risks.append(f"Holder base still small ({holders}).")
+    if not comm.get("deployer"):
+        risks.append("Deployer not indexed on free sources — verify manually on explorer.")
+    if comm.get("rugged"):
+        risks.append("Automated rug flag present — treat as high risk until proven otherwise.")
+    if not risks:
+        risks.append("No strong automated red flags from free data — still verify LP lock, mint authority, tax.")
+    for r in risks:
+        lines.append(f"• {esc(r)}")
+
+    lines += ["", "💡 <b>WHAT WOULD HELP THE PROJECT</b>"]
+    tips = []
+    if kind.get("type") == "meme" or "meme" in str(kind.get("label") or "").lower():
+        tips = [
+            "Publish clear buy links + official CA in one pinned place.",
+            "Show LP status (locked/burned) in plain language for the community.",
+            "Keep one consistent narrative (meme lore) across X + TG — less scatter.",
+            "Avoid fake 'utility' claims; lean into culture, transparency, and fun.",
+        ]
+    else:
+        tips = [
+            "Surface contract addresses + chain on the site header.",
+            "Explain mint / upgrade / admin powers in one short trust page.",
+            "If LP is locked or renounced, state it clearly with proof links.",
+            "Show real product usage (screens, metrics) next to token stats.",
+        ]
+    if liq and liq < 10000:
+        tips.append("Deeper liquidity reduces volatility that scares serious size.")
+    for t in tips:
+        lines.append(f"• {esc(t)}")
+
     lines += [
         "",
-        "📊 Market snapshot",
-        f"Liquidity: {esc(money(p.get('liquidity_usd')))}",
-        f"Volume 24h: {esc(money(p.get('volume_24h')))}",
-        f"FDV: {esc(money(p.get('fdv')))}",
-        f"Price: {esc(money(p.get('price_usd')))}",
-        f"DEX: {esc(p.get('dex') or '—')}",
-        "",
-        "Note: free holder + deployer data is currently reliable mainly for Solana (pump.fun).",
-        "Other chains show — until a free source is wired.",
-        "",
         f"🎯 Opportunity: {s['band']} {s['score']}/100",
+        "<i>Free data is incomplete on many chains — always cross-check explorer.</i>",
     ]
     return "\n".join(lines)
+
 
 
 async def approach_text(p: dict[str, Any]) -> str:
@@ -1980,40 +1997,44 @@ def copyable_brief(text: str) -> str:
 
 
 def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
-    """Update when more socials appear after the project was already identified."""
+    """Social update — especially Telegram group creation after X/site only."""
     chain = (p.get("chain") or "?").upper()
     kind = classify_project(p)
-    src_badge = source_label(p)
-    parts: list[str] = [
-        f"🔔 <b>SOCIAL UPDATE ({esc(chain)})</b> · {src_badge}",
+    src_badge = source_label(p, for_alert=True)
+    head = f"🔔 <b>SOCIAL UPDATE ({esc(chain)})</b>"
+    if src_badge:
+        head += f" · {src_badge}"
+    lines = [
+        head,
         f"<b>{esc(title_of(p))}</b> · {kind['label']}",
+        f"Contract: <code>{esc(p.get('token_address') or '—')}</code>",
+        "",
     ]
-    # Emphasize Telegram group creation / discovery
     if "telegram" in kinds and p.get("telegram"):
-        parts.append(f"💬 <b>Telegram group detected</b>: {esc(p.get('telegram'))}")
+        lines += [
+            "💬 <b>TELEGRAM GROUP CREATED / DETECTED</b>",
+            esc(str(p.get("telegram"))),
+            "",
+        ]
     if "x" in kinds and p.get("twitter"):
-        parts.append(f"𝕏 <b>X account detected</b>: {esc(p.get('twitter'))}")
+        lines += ["𝕏 <b>X DETECTED</b>", esc(str(p.get("twitter"))), ""]
     if "website" in kinds and p.get("website"):
-        parts.append(f"🌐 <b>Website detected</b>: {esc(p.get('website'))}")
-    if "discord" in kinds and p.get("discord"):
-        parts.append(f"💬 <b>Discord detected</b>: {esc(p.get('discord'))}")
-    label = ", ".join(k.upper() for k in kinds)
-    parts.append(f"Channels updated: <b>{esc(label)}</b>")
-    parts.append(f"Contract: <code>{esc(p.get('token_address') or '—')}</code>")
-    parts.append(
-        f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
-        f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}"
-    )
-    parts.append(f"First seen: {esc(ago(p.get('discovered_at')))}")
-    return "\n".join(parts)
+        lines += ["🌐 <b>WEBSITE DETECTED</b>", esc(str(p.get("website"))), ""]
+    lines += [
+        f"💰 MCAP: <b>{esc(money(p.get('market_cap')))}</b> · 💧 {esc(money(p.get('liquidity_usd')))}",
+        f"Channels: {esc(', '.join(k.upper() for k in kinds))}",
+        f"First seen: {esc(ago(p.get('discovered_at')))}",
+    ]
+    return "\n".join(lines)
+
 
 
 def alert_text(p: dict[str, Any]) -> str:
-    """Identity alert: contract + verified social presence. Not a raw deploy ping."""
+    """Identity alert: clean, scannable, market cap visible."""
     s = score_project(p)
     chain = (p.get("chain") or "?").upper()
     kind = classify_project(p)
-    src_badge = source_label(p)
+    src_badge = source_label(p, for_alert=True)
     identity = []
     if p.get("twitter"):
         identity.append("X")
@@ -2024,43 +2045,53 @@ def alert_text(p: dict[str, Any]) -> str:
     if p.get("discord"):
         identity.append("Discord")
     id_line = " + ".join(identity) if identity else "social"
+    head = f"🚨 <b>NEW PROJECT IDENTIFIED ({esc(chain)})</b>"
+    if src_badge:
+        head += f" · {src_badge}"
+    mcap = p.get("market_cap")
+    fdv = p.get("fdv")
     lines = [
-        f"🚨 <b>NEW PROJECT IDENTIFIED ({esc(chain)})</b> · {src_badge}",
+        head,
         f"<b>{esc(title_of(p))}</b> · {kind['label']}",
         f"Identity: <b>{esc(id_line)}</b>",
         f"Contract: <code>{esc(p.get('token_address') or '—')}</code>",
-        f"⛓ {esc((p.get('chain') or '?').title())}",
+        "",
+        f"💰 MCAP: <b>{esc(money(mcap))}</b> · FDV: {esc(money(fdv))}",
+        f"💧 Liq: {esc(money(p.get('liquidity_usd')))} · 📊 Vol 24h: {esc(money(p.get('volume_24h')))}",
+        "",
     ]
     if p.get("telegram"):
-        lines.append(f"💬 Telegram: {esc(p.get('telegram'))}")
+        lines.append(f"💬 TG: {esc(p.get('telegram'))}")
     if p.get("twitter"):
         lines.append(f"𝕏 X: {esc(p.get('twitter'))}")
     if p.get("website"):
         lines.append(f"🌐 Web: {esc(p.get('website'))}")
-    lines.append(
-        f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
-        f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}"
-    )
-    lines.append(f"First contract/candidate seen: {esc(ago(p.get('discovered_at')))}")
-    lines.append(f"💧 {esc(money(p.get('liquidity_usd')))} · 📊 {esc(money(p.get('volume_24h')))}")
-    lines.append(f"🎯 {s['band']} {s['score']}/100")
+    lines += [
+        "",
+        f"First seen: {esc(ago(p.get('discovered_at')))}",
+        f"🎯 {s['band']} {s['score']}/100",
+    ]
     return "\n".join(lines)
 
 
-def source_label(p: dict[str, Any]) -> str:
-    """Human badge for where Scout first/mainly saw the project."""
+
+def source_label(p: dict[str, Any], *, for_alert: bool = False) -> str:
+    """Badge for listing source. Alerts hide DexScreener noise; keep CMC/CG."""
     s = (p.get("source") or "").lower()
     if s in {"cmc", "coinmarketcap"}:
         return "📈 CMC"
     if s in {"coingecko", "cg", "gecko-trending"}:
         return "🦎 CoinGecko"
+    if for_alert:
+        # Dex / gecko discovery is default Scout path — no badge clutter
+        return ""
     if s in {"gecko", "geckoterminal"}:
         return "🦎 GeckoTerminal"
     if s.startswith("dex") or s in {"dex-profile", "dex-pair", "dex-boost"}:
-        return "📡 DexScreener"
+        return ""  # don't show DexScreener label
     if s:
-        return f"📡 {s}"
-    return "📡 Scout"
+        return s
+    return ""
 
 
 def has_project_identity(p: dict[str, Any]) -> bool:
@@ -2078,14 +2109,57 @@ def allowed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return user_id in owners
 
 
+
+async def safe_cb_answer(query, text: str | None = None, show_alert: bool = False) -> None:
+    try:
+        if text:
+            await query.answer(text, show_alert=show_alert)
+        else:
+            await query.answer()
+    except Exception as exc:
+        log.debug("cb answer: %s", exc)
+
+
+async def safe_edit(query, text: str, reply_markup=None) -> None:
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+    except Exception as exc:
+        err = str(exc).lower()
+        if "not modified" in err:
+            await safe_cb_answer(query, "Already up to date")
+            return
+        log.warning("edit_message failed: %s", exc)
+        try:
+            # fallback: send new message so user still gets result
+            await query.message.reply_html(
+                text, disable_web_page_preview=True, reply_markup=reply_markup
+            )
+        except Exception as exc2:
+            log.warning("reply fallback failed: %s", exc2)
+
+
+
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if not user:
         return False
     await claim_owner_if_needed(context, user.id)
     if not allowed(user.id, context):
-        if update.effective_message:
-            await update.effective_message.reply_text("This Scout is private.")
+        if update.callback_query:
+            await safe_cb_answer(
+                update.callback_query,
+                "This Scout is private (wrong Telegram account / ALLOWED_USER_IDS).",
+                show_alert=True,
+            )
+        elif update.effective_message:
+            await update.effective_message.reply_text(
+                "This Scout is private (wrong Telegram account / ALLOWED_USER_IDS)."
+            )
         return False
     return True
 
@@ -2260,29 +2334,34 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
+    if not update.callback_query or not update.callback_query.data:
         return
-    await update.callback_query.answer("Researching…")
-    pid = int(update.callback_query.data.split(":")[1])
+    if not await gate(update, context):
+        return
+    q = update.callback_query
+    await safe_cb_answer(q, "Researching…")
+    try:
+        pid = int(q.data.split(":")[1])
+    except (IndexError, ValueError):
+        await safe_cb_answer(q, "Bad button data", show_alert=True)
+        return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await update.callback_query.answer(
-            "That button is from before a restart. Send /jobs and open it again.",
-            show_alert=True,
-        )
+        await safe_cb_answer(q, "Expired — send /jobs again", show_alert=True)
         return
-    project = await enrich_one(db, client, project, context.bot)
-    await update.callback_query.edit_message_text(
-        report_text(project),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=report_keyboard(project),
-    )
+    try:
+        project = await enrich_one(db, client, project, context.bot)
+        await safe_edit(q, report_text(project), report_keyboard(project))
+    except Exception as exc:
+        log.exception("cb_investigate failed")
+        await safe_cb_answer(q, f"Error: {str(exc)[:80]}", show_alert=True)
 
 
 async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await gate(update, context) or not update.callback_query or not update.effective_user:
+    if not update.callback_query or not update.effective_user:
+        return
+    if not await gate(update, context):
         return
     pid = int(update.callback_query.data.split(":")[1])
     db, _ = deps(context)
@@ -2524,6 +2603,29 @@ async def cb_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     except Exception as exc:
         log.warning("edit gaps failed: %s", exc)
+
+async def cb_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
+        return
+    await update.callback_query.answer("Risks…")
+    try:
+        pid = int(update.callback_query.data.split(":")[1])
+    except Exception:
+        return
+    db, client = deps(context)
+    project = await db.by_id(pid)
+    if not project:
+        await update.callback_query.answer("Expired — /jobs again", show_alert=True)
+        return
+    project = await enrich_one(db, client, project, context.bot)
+    text = await risks_text(project)
+    try:
+        await update.callback_query.edit_message_text(
+            text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=report_keyboard(project)
+        )
+    except Exception as exc:
+        log.warning("edit risks failed: %s", exc)
+
 
 
 async def cb_onchain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2877,6 +2979,33 @@ async def note_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def on_start(app: Application) -> None:
+    try:
+        await app.bot.set_my_commands(
+            [
+                BotCommand("start", "Start Scout"),
+                BotCommand("help", "Command list"),
+                BotCommand("newtokens", "New projects catch-up"),
+                BotCommand("project", "Full report by CA or id"),
+                BotCommand("jobs", "Opportunity shortlist"),
+                BotCommand("digest", "Top picks window"),
+                BotCommand("approach", "Persona openers"),
+                BotCommand("ask", "Ask AI about a project"),
+                BotCommand("gaps", "Gaps (meme or utility aware)"),
+                BotCommand("risks", "On-chain + web + X risks"),
+                BotCommand("watch", "Watch CA until socials"),
+                BotCommand("unwatch", "Remove from watchlist"),
+                BotCommand("watchlist", "Your watches"),
+                BotCommand("cg", "CoinGecko listings"),
+                BotCommand("cmc", "CMC new listings"),
+                BotCommand("early", "Early / thin liquidity"),
+                BotCommand("alerts", "alerts on|off"),
+                BotCommand("status", "Scanner + keys status"),
+            ]
+        )
+        log.info("Telegram command menu registered")
+    except Exception as exc:
+        log.warning("set_my_commands failed: %s", exc)
+
     db: DB = app.bot_data["db"]
     await db.connect()
     app.bot_data["http"] = httpx.AsyncClient(headers={"User-Agent": "Web3ProjectScout/1.0"}, timeout=25)
@@ -2903,7 +3032,26 @@ async def on_stop(app: Application) -> None:
 
 
 
+async def cmd_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /risks <id|CA|chain:CA>")
+        return
+    db, client = deps(context)
+    project = await resolve_id_or_ca(db, client, " ".join(context.args), context.bot)
+    if not project:
+        await update.effective_message.reply_text("Could not resolve.")
+        return
+    project = await enrich_one(db, client, project, context.bot)
+    text = await risks_text(project)
+    await update.effective_message.reply_html(
+        text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
+    )
+
+
 async def cmd_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
@@ -2923,71 +3071,203 @@ async def cmd_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def gaps_text(p: dict[str, Any]) -> str:
-    s = score_project(p)
-    comm = community(p)
+    """Meme-aware vs utility-aware gap analysis. No cookie-cutter whitepaper nagging for memes."""
     kind = classify_project(p)
-    what = p.get("description") or comm.get("site_about") or "No description."
-    tweets = comm.get("x_tweets") or []
-    tweet_blob = "\\n".join(f"- {(t.get('text') or '')[:140]}" for t in tweets[:5]) or "No recent X posts indexed."
-    prompt = (
-        f"You are a critical product reviewer for a Web3 community operator (NOT a trader).\\n"
-        f"Project: {title_of(p)}\\nChain: {p.get('chain')}\\nType label: {kind['label']}\\n"
-        f"Website: {p.get('website')}\\nX: {p.get('twitter')}\\nTelegram: {p.get('telegram')}\\nDocs: {p.get('docs')}\\n"
-        f"Site title: {comm.get('site_title')}\\nAbout: {what}\\n"
-        f"TG about: {comm.get('tg_about')}\\nTG members: {comm.get('tg_members')}\\n"
-        f"Recent X posts:\\n{tweet_blob}\\n\\n"
-        f"Write a GAP & RISK brief. Use these exact section headers:\\n"
-        f"PRODUCT GAPS\\nCOMMUNITY GAPS\\nSOCIAL / X GAPS\\nTRUST / RISK FLAGS\\nWHAT WOULD MAKE THIS STRONGER\\n"
-        f"Each section: 2-4 short bullets. Be specific to THIS project. No price predictions. No 'buy' language.\\n"
-        f"If data is thin, say what is missing. Seed {random.randint(1,9999)}."
-    )
-    generated = await llm_write(prompt)
+    is_meme = kind.get("type") == "meme" or "🐸" in str(kind.get("label") or "") or "meme" in str(kind.get("label") or "").lower()
+    ctx = project_brief_for_llm(p) if "project_brief_for_llm" in dir() else _project_ctx(p)
+
+    if is_meme:
+        prompt = (
+            f"{ctx}\n\n"
+            "This is a MEME / culture coin. Do NOT demand whitepaper, roadmap, audit, or enterprise docs.\n"
+            "Focus on meme-native gaps: unclear CA posts, scattered lore, dead TG energy, "
+            "no LP transparency, mixed signals, weak mascot story, confusing buy path.\n"
+            "Return labels:\nMEME_VIBE\nWHAT_WORKS\nMEME_PROBLEMS\nCOMMUNITY_GAPS\n"
+            "TRUST_SHORTCUTS\nCONTENT_ANGLES\nINVESTOR_TURN_OFFS\nFIXES\n"
+            "Tone: sharp, meme-literate, practical. No generic 'add a roadmap' advice."
+        )
+    else:
+        prompt = (
+            f"{ctx}\n\n"
+            "This looks UTILITY / product-led. Dig into product UX clarity, trust, and investor-grade questions.\n"
+            "Do NOT ask questions already answered on the website text provided.\n"
+            "Prefer: differentiation vs competitors, retention loop, who pays, why token, "
+            "admin keys, launch readiness, proof of usage.\n"
+            "Labels:\nPRODUCT_UX\nWHAT_SITE_ALREADY_SAYS\nREAL_GAPS\nINVESTOR_QUESTIONS\n"
+            "COMPETITOR_EDGE\nTRUST_GAPS\nCONTENT_OPPORTUNITIES\nFIXES\n"
+            "No filler. Evidence-based only."
+        )
+    out = await llm_complete(prompt) if False else await _llm_gaps(prompt)
     header = [
-        "🔍 <b>GAP & RISK ANALYSIS</b>",
-        f"<b>{esc(title_of(p))}</b> · {kind['label']} · {s['band']} {s['score']}/100",
-        f"⛓ {esc((p.get('chain') or '?').title())}",
+        "🔍 <b>GAPS &amp; FIT</b>",
+        f"<b>{esc(title_of(p))}</b> · {kind['label']}",
+        f"💰 MCAP: <b>{esc(money(p.get('market_cap')))}</b>",
         "",
     ]
-    if generated:
-        body = [esc(generated)]
-        # soft format lines
-        body = []
-        for line in generated.splitlines():
-            t = line.strip()
-            up = t.upper().rstrip(":")
-            if up in {"PRODUCT GAPS", "COMMUNITY GAPS", "SOCIAL / X GAPS", "TRUST / RISK FLAGS", "WHAT WOULD MAKE THIS STRONGER"}:
-                body.append(f"<b>{esc(t)}</b>")
-            elif t.startswith("-") or t.startswith("•"):
-                body.append(f"• {esc(t.lstrip('-• ').strip())}")
-            elif t:
-                body.append(esc(t))
-            else:
-                body.append("")
-    else:
-        body = [
-            f"⚠️ AI offline — heuristic only · {esc(KEY_STATUS.get('groq') or KEY_STATUS.get('openrouter') or 'no key')}",
+    if not out:
+        # heuristic fallback
+        body = _gaps_fallback(p, is_meme)
+        return "\n".join(header + body)
+    # format lightly
+    text = out.replace("**", "")
+    lines = header + [esc(ln) if not ln.startswith("•") else ln for ln in text.splitlines()[:80]]
+    # Actually escape carefully
+    pretty = []
+    for ln in text.splitlines()[:90]:
+        ln = ln.strip()
+        if not ln:
+            pretty.append("")
+            continue
+        if ln.isupper() and len(ln) < 40:
+            pretty.append(f"\n<b>{esc(ln.title())}</b>")
+        elif ln.startswith("•") or ln.startswith("-"):
+            pretty.append("• " + esc(ln.lstrip("•- ").strip()))
+        else:
+            pretty.append(esc(ln))
+    return "\n".join(header + pretty)
+
+
+def _project_ctx(p: dict[str, Any]) -> str:
+    comm = community(p)
+    return (
+        f"Name: {title_of(p)}\nChain: {p.get('chain')}\nCA: {p.get('token_address')}\n"
+        f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTG: {p.get('telegram')}\n"
+        f"Desc: {p.get('description')}\nSite about: {comm.get('site_about')}\n"
+        f"TG about: {comm.get('tg_about')}\nLiq: {p.get('liquidity_usd')} MCAP: {p.get('market_cap')}\n"
+        f"Holders: {comm.get('holders')} Deployer: {comm.get('deployer')}"
+    )
+
+
+def _gaps_fallback(p: dict[str, Any], is_meme: bool) -> list[str]:
+    if is_meme:
+        return [
+            "<b>Meme problems to check</b>",
+            "• " + ("Official TG missing — culture needs a campfire" if not p.get("telegram") else "TG linked — is the lore pinned?"),
+            "• " + ("X missing" if not p.get("twitter") else "X linked — is CA consistent in bio?"),
+            "• LP / mint status not obvious from free data — community will ask.",
             "",
-            "<b>PRODUCT GAPS</b>",
-            "• " + ("No docs linked" if not p.get("docs") else "Docs present — still verify clarity"),
-            "• " + ("No website" if not p.get("website") else "Website exists — check if product is usable"),
-            "• " + ("Description thin" if len(str(p.get("description") or "")) < 40 else "Has a description"),
-            "",
-            "<b>COMMUNITY GAPS</b>",
-            "• " + ("No Telegram" if not p.get("telegram") else f"Telegram linked ({esc(comm.get('tg_members') or '?')} members)"),
-            "• " + ("No Discord" if not p.get("discord") else "Discord linked"),
-            "",
-            "<b>SOCIAL / X GAPS</b>",
-            "• " + ("No X account" if not p.get("twitter") else "X linked — review post quality manually"),
-            "",
-            "<b>TRUST / RISK FLAGS</b>",
-            "• Early project — treat claims as unverified",
-            "• " + ("Thin liquidity" if (p.get("liquidity_usd") or 0) < 5000 else "Liquidity present"),
-            "",
-            "<b>WHAT WOULD MAKE THIS STRONGER</b>",
-            "• Clear product path + FAQ pinned in chat",
-            "• Consistent official links in bio / website",
+            "<b>Meme-native content angles</b>",
+            "• One clear 'how to buy' card (CA + chain + link).",
+            "• Lore thread that matches the ticker energy.",
+            "• Transparent LP post > fake utility roadmap.",
         ]
-    return "\\n".join(header + body)
+    return [
+        "<b>Product / trust gaps</b>",
+        "• " + ("No site" if not p.get("website") else "Site present — check if product path is obvious above the fold"),
+        "• " + ("No docs" if not p.get("docs") else "Docs linked"),
+        "• Token role vs product value may need sharper explanation",
+        "",
+        "<b>Investor-style questions</b>",
+        "• Who is the paying user if the token did not exist?",
+        "• What is non-replicable vs the nearest competitor?",
+        "• Which admin powers remain on the contracts?",
+    ]
+
+
+async def _llm_gaps(prompt: str) -> str:
+    """Use the bot's existing LLM stack if present."""
+    try:
+        # Scout may use different function names
+        if "llm_write" in globals():
+            return await llm_write(prompt)  # type: ignore
+    except Exception:
+        pass
+    # try inline via approach path - search for common complete function
+    return await _scout_llm(prompt)
+
+
+async def _scout_llm(prompt: str) -> str:
+    import httpx as _hx
+    groq = (os.getenv("GROQ_API_KEY") or "").strip().strip('"')
+    ork = (os.getenv("OPENROUTER_API_KEY") or "").strip().strip('"')
+    system = "Web3 project analyst. Concise. No investment advice. No invented metrics."
+    async with _hx.AsyncClient(timeout=60) as client:
+        for name, key, url, model in [
+            ("groq", groq, "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile"),
+            ("groq", groq, "https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-20b"),
+            ("openrouter", ork, "https://openrouter.ai/api/v1/chat/completions", "openai/gpt-4o-mini"),
+        ]:
+            if not key:
+                continue
+            try:
+                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+                if name == "openrouter":
+                    headers["HTTP-Referer"] = "https://railway.app"
+                r = await client.post(
+                    url,
+                    headers=headers,
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt[:12000]},
+                        ],
+                    },
+                )
+                if r.status_code >= 400:
+                    continue
+                data = r.json()
+                text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+    return ""
+
+
+async def risks_text(p: dict[str, Any]) -> str:
+    """Unified risks: on-chain + web + X, with how to fix investor turn-offs."""
+    kind = classify_project(p)
+    is_meme = "meme" in str(kind.get("label") or "").lower() or kind.get("type") == "meme"
+    ctx = _project_ctx(p)
+    prompt = (
+        f"{ctx}\n\nType hint: {'MEME' if is_meme else 'UTILITY'}\n"
+        "Produce risk intelligence with labels:\n"
+        "ONCHAIN_RISKS\nWEBSITE_RISKS\nX_SOCIAL_RISKS\nINVESTOR_TURN_OFFS\nHOW_TO_FIX\n"
+        "Be specific to available evidence. Never invent holder %, tax, or LP lock facts.\n"
+        "For memes: skip whitepaper lectures; focus on transparency, LP, narrative consistency.\n"
+        "For utility: focus on product trust, admin power, unclear token capture."
+    )
+    out = await _scout_llm(prompt)
+    comm = community(p)
+    lines = [
+        "⚠️ <b>RISK BRIEF</b>",
+        f"<b>{esc(title_of(p))}</b> · {kind['label']}",
+        f"💰 MCAP: <b>{esc(money(p.get('market_cap')))}</b> · 💧 {esc(money(p.get('liquidity_usd')))}",
+        "",
+        "⛓ <b>ON-CHAIN (observed)</b>",
+        f"Deployer: <code>{esc(comm.get('deployer') or '—')}</code>",
+        f"Holders: {esc(comm.get('holders') if comm.get('holders') is not None else '—')}",
+        f"Rugcheck: {esc(comm.get('rugcheck_score') if comm.get('rugcheck_score') is not None else '—')}",
+    ]
+    if float(p.get("liquidity_usd") or 0) < 5000:
+        lines.append("• Thin liquidity — market-cap moves can be fragile.")
+    if not out:
+        lines += [
+            "",
+            "⚠️ AI risk narrative unavailable — showing automated signals only.",
+            "",
+            "🎯 <b>HOW TO IMPROVE TRUST</b>",
+            "• Publish CA + LP status in one official place.",
+            "• Keep X/TG links consistent.",
+            "• Avoid overclaiming; show proof links.",
+        ]
+        return "\n".join(lines)
+    text = out.replace("**", "")
+    lines.append("")
+    for ln in text.splitlines()[:70]:
+        ln = ln.strip()
+        if not ln:
+            lines.append("")
+            continue
+        if ln.isupper() and len(ln) < 36:
+            lines.append(f"\n<b>{esc(ln.replace('_', ' ').title())}</b>")
+        elif ln.startswith("•") or ln.startswith("-"):
+            lines.append("• " + esc(ln.lstrip("•- ").strip()))
+        else:
+            lines.append(esc(ln))
+    return "\n".join(lines)
+
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3350,6 +3630,7 @@ def main() -> None:
     app.add_handler(CommandHandler("early", cmd_early))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("gaps", cmd_gaps))
+    app.add_handler(CommandHandler("risks", cmd_risks))
     app.add_handler(CommandHandler("cg", cmd_cg))
     app.add_handler(CommandHandler("cmc", cmd_cmc))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -3359,6 +3640,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_shuffle, pattern=r"^sh:"))
     app.add_handler(CallbackQueryHandler(cb_onchain, pattern=r"^oc:"))
     app.add_handler(CallbackQueryHandler(cb_gaps, pattern=r"^gp:"))
+    app.add_handler(CallbackQueryHandler(cb_risks, pattern=r"^rk:"))
     app.add_handler(CallbackQueryHandler(cb_watch, pattern=r"^w:"))
     log.info("Polling Telegram…")
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
