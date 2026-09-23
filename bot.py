@@ -1678,7 +1678,7 @@ def list_item(index: int, p: dict[str, Any]) -> str:
     s = score_project(p)
     kind = classify_project(p)
     return (
-        f"<b>{index}.</b> {esc(title_of(p))} · {s['band']} {s['score']} · {kind['label']}\n"
+        f"<b>{index}.</b> {esc(title_of(p))} · {s['band']} {s['score']} · {kind['label']} · {source_label(p)}\n"
         f"⛓ {esc((p.get('chain') or '?').title())} · 🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}\n"
         f"💧 {esc(money(p.get('liquidity_usd')))} · 📊 {esc(money(p.get('volume_24h')))}\n"
         f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
@@ -1710,7 +1710,7 @@ def report_text(p: dict[str, Any]) -> str:
         f"⛓ {(p.get('chain') or '?').title()}",
         f"🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}",
         f"🎯 Opportunity: <b>{s['band']}</b> {s['score']}/100",
-        f"{classify_project(p)['label']}",
+        f"{classify_project(p)['label']} · {source_label(p)}",
         f"🏷 CA: <code>{esc(p.get('token_address') or '')}</code>",
         f"🕒 First stored: {esc(ago(p.get('discovered_at')))}",
         "",
@@ -1983,16 +1983,29 @@ def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
     """Update when more socials appear after the project was already identified."""
     chain = (p.get("chain") or "?").upper()
     kind = classify_project(p)
+    src_badge = source_label(p)
+    parts: list[str] = [
+        f"🔔 <b>SOCIAL UPDATE ({esc(chain)})</b> · {src_badge}",
+        f"<b>{esc(title_of(p))}</b> · {kind['label']}",
+    ]
+    # Emphasize Telegram group creation / discovery
+    if "telegram" in kinds and p.get("telegram"):
+        parts.append(f"💬 <b>Telegram group detected</b>: {esc(p.get('telegram'))}")
+    if "x" in kinds and p.get("twitter"):
+        parts.append(f"𝕏 <b>X account detected</b>: {esc(p.get('twitter'))}")
+    if "website" in kinds and p.get("website"):
+        parts.append(f"🌐 <b>Website detected</b>: {esc(p.get('website'))}")
+    if "discord" in kinds and p.get("discord"):
+        parts.append(f"💬 <b>Discord detected</b>: {esc(p.get('discord'))}")
     label = ", ".join(k.upper() for k in kinds)
-    return (
-        f"🔔 <b>SOCIAL UPDATE ({esc(chain)})</b>\n"
-        f"<b>{esc(title_of(p))}</b> · {kind['label']}\n"
-        f"Newly detected: <b>{esc(label)}</b>\n"
-        f"Contract: <code>{esc(p.get('token_address') or '—')}</code>\n"
+    parts.append(f"Channels updated: <b>{esc(label)}</b>")
+    parts.append(f"Contract: <code>{esc(p.get('token_address') or '—')}</code>")
+    parts.append(
         f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
-        f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}\n"
-        f"First seen: {esc(ago(p.get('discovered_at')))}"
+        f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}"
     )
+    parts.append(f"First seen: {esc(ago(p.get('discovered_at')))}")
+    return "\n".join(parts)
 
 
 def alert_text(p: dict[str, Any]) -> str:
@@ -2000,6 +2013,7 @@ def alert_text(p: dict[str, Any]) -> str:
     s = score_project(p)
     chain = (p.get("chain") or "?").upper()
     kind = classify_project(p)
+    src_badge = source_label(p)
     identity = []
     if p.get("twitter"):
         identity.append("X")
@@ -2010,18 +2024,43 @@ def alert_text(p: dict[str, Any]) -> str:
     if p.get("discord"):
         identity.append("Discord")
     id_line = " + ".join(identity) if identity else "social"
-    return (
-        f"🚨 <b>NEW PROJECT IDENTIFIED ({esc(chain)})</b>\n"
-        f"<b>{esc(title_of(p))}</b> · {kind['label']}\n"
-        f"Identity: <b>{esc(id_line)}</b>\n"
-        f"Contract: <code>{esc(p.get('token_address') or '—')}</code>\n"
-        f"⛓ {esc((p.get('chain') or '?').title())}\n"
+    lines = [
+        f"🚨 <b>NEW PROJECT IDENTIFIED ({esc(chain)})</b> · {src_badge}",
+        f"<b>{esc(title_of(p))}</b> · {kind['label']}",
+        f"Identity: <b>{esc(id_line)}</b>",
+        f"Contract: <code>{esc(p.get('token_address') or '—')}</code>",
+        f"⛓ {esc((p.get('chain') or '?').title())}",
+    ]
+    if p.get("telegram"):
+        lines.append(f"💬 Telegram: {esc(p.get('telegram'))}")
+    if p.get("twitter"):
+        lines.append(f"𝕏 X: {esc(p.get('twitter'))}")
+    if p.get("website"):
+        lines.append(f"🌐 Web: {esc(p.get('website'))}")
+    lines.append(
         f"🌐 {mark(p.get('website'))}  𝕏 {mark(p.get('twitter'))}  "
-        f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}\n"
-        f"First contract/candidate seen: {esc(ago(p.get('discovered_at')))}\n"
-        f"💧 {esc(money(p.get('liquidity_usd')))} · 📊 {esc(money(p.get('volume_24h')))}\n"
-        f"🎯 {s['band']} {s['score']}/100"
+        f"💬 {mark(p.get('telegram'))}  📚 {mark(p.get('docs'))}"
     )
+    lines.append(f"First contract/candidate seen: {esc(ago(p.get('discovered_at')))}")
+    lines.append(f"💧 {esc(money(p.get('liquidity_usd')))} · 📊 {esc(money(p.get('volume_24h')))}")
+    lines.append(f"🎯 {s['band']} {s['score']}/100")
+    return "\n".join(lines)
+
+
+def source_label(p: dict[str, Any]) -> str:
+    """Human badge for where Scout first/mainly saw the project."""
+    s = (p.get("source") or "").lower()
+    if s in {"cmc", "coinmarketcap"}:
+        return "📈 CMC"
+    if s in {"coingecko", "cg", "gecko-trending"}:
+        return "🦎 CoinGecko"
+    if s in {"gecko", "geckoterminal"}:
+        return "🦎 GeckoTerminal"
+    if s.startswith("dex") or s in {"dex-profile", "dex-pair", "dex-boost"}:
+        return "📡 DexScreener"
+    if s:
+        return f"📡 {s}"
+    return "📡 Scout"
 
 
 def has_project_identity(p: dict[str, Any]) -> bool:
@@ -2624,11 +2663,13 @@ async def monitor_watches(app: Application) -> None:
             continue
         chain = (fresh.get("chain") or "?").upper()
         text = (
-            f"⭐ <b>WATCH ALERT ({esc(chain)})</b>\\n"
-            f"#{pid} {esc(title_of(fresh))}\\n"
-            + "\\n".join(esc(d) for d in diffs)
-            + f"\\n\\n💧 {esc(money(fresh.get('liquidity_usd')))} · 📊 {esc(money(fresh.get('volume_24h')))}"
+            f"⭐ <b>WATCH ALERT ({esc(chain)})</b> · {source_label(fresh)}\n"
+            f"#{pid} {esc(title_of(fresh))}\n"
+            + "\n".join(esc(d) for d in diffs)
         )
+        if fresh.get("telegram"):
+            text += f"\n💬 Telegram: {esc(fresh.get('telegram'))}"
+        text += f"\n\n💧 {esc(money(fresh.get('liquidity_usd')))} · 📊 {esc(money(fresh.get('volume_24h')))}"
         try:
             await app.bot.send_message(
                 chat_id=uid,
@@ -3041,8 +3082,9 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db, client = deps(context)
     await update.effective_message.reply_text("🦎 Scanning CoinGecko trending (socials only)…")
     lines = [
-        "🦎 <b>COINGECKO · SOCIALS ACTIVE</b>",
-        "Tap a project below to Investigate / Approach / Gaps",
+        "🦎 <b>COINGECKO · LATEST + SOCIALS</b>",
+        "Source: CoinGecko · only items with website / X / Telegram",
+        "Tap a project to Investigate / Approach / Gaps / Watch",
         "",
     ]
     saved: list[dict[str, Any]] = []
@@ -3118,7 +3160,7 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if row:
                 saved.append(row)
                 lines.append(
-                    f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())}\n"
+                    f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())} · 🦎 CG\n"
                     f"🌐 {mark(row.get('website'))}  𝕏 {mark(row.get('twitter'))}  💬 {mark(row.get('telegram'))}"
                 )
             if len(saved) >= 10:
@@ -3141,7 +3183,8 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db, client = deps(context)
     await update.effective_message.reply_text("📈 Scanning CMC new listings (socials + contract)…")
     lines = [
-        "📈 <b>CMC NEW · SOCIALS ACTIVE</b>",
+        "📈 <b>CMC · NEWLY LISTED + SOCIALS</b>",
+        "Source: CoinMarketCap · last ~7 days · website / X / Telegram required",
         "Tap a project to Investigate / Approach / Gaps / Watch",
         "",
     ]
@@ -3220,6 +3263,17 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         chain = CMC_CHAIN_MAP.get((platforms[0].get("contractPlatform") or "").lower(), chain)
             if not (website or twitter or telegram or discord):
                 continue
+            # Only newly listed (last 7 days)
+            added_raw = c.get("dateAdded") or ""
+            try:
+                if isinstance(added_raw, str) and "T" in added_raw:
+                    from datetime import datetime, timezone
+                    dt = datetime.fromisoformat(added_raw.replace("Z", "+00:00"))
+                    age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+                    if age_days > 7:
+                        continue
+            except Exception:
+                pass
             price = None
             quotes = c.get("quotes")
             if isinstance(quotes, list) and quotes:
@@ -3246,8 +3300,8 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             saved.append(row)
             lines.append(
-                f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())}\n"
-                f"added {esc(added)} · {esc(money(price) if price is not None else '—')}\n"
+                f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())} · 📈 CMC\n"
+                f"listed {esc(added)} · {esc(money(price) if price is not None else '—')}\n"
                 f"🌐 {mark(row.get('website'))}  𝕏 {mark(row.get('twitter'))}  💬 {mark(row.get('telegram'))}"
             )
             if len(saved) >= 10:
