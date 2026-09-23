@@ -118,29 +118,26 @@ HELP = """🔎 <b>Web3 Project Scout</b>
 
 Finds early public-facing projects and stores them while you sleep.
 
-/newtokens — everything since your last check
-/newtokens 6h — last 6 hours
-/newtokens 24h — last 24 hours
-/newtokens 3d — last 3 days
-/project &lt;CA or chain:CA&gt; — investigate any contract you found
-/research &lt;same&gt;
-/jobs — scored shortlist
-/digest 12h — morning 5
-/approach &lt;id&gt; — tailored comments (X and/or Telegram)
+/newtokens [6h|12h|24h|3d] — catch-up list
+/project &lt;CA or chain:CA&gt; — full report + Approach / On-chain
+/jobs — opportunity shortlist
+/digest 12h — morning top picks
+/approach &lt;id&gt; — persona openers
 /ask &lt;id&gt; &lt;question&gt; — persona replies to a TG question
-/early — pre-token / social-first projects
-/watchlist
+/gaps &lt;id&gt; — product / TG / X gap &amp; risk analysis
+/watch &lt;id or CA&gt; — monitor until socials / liquidity / activity appear
+/unwatch &lt;id&gt;
+/watchlist — your monitored projects
+/cg — newly listed on CoinGecko (needs COINGECKO_API_KEY optional)
+/cmc — market listings snapshot (needs CMC_API_KEY optional)
+/early — social-first / thin liquidity
 /alerts on|off
 /status
 
-Alerts:
-🚨 new public project
-📡 socials appeared later (X/TG showed up after first seen)
+Watch alerts (while you are offline too — Telegram delivers when you open the app):
+📡 socials appeared · 💧 liquidity jump · 📊 volume spike · 📝 profile changed
 
-Labels:
-🔧 Utility — product / protocol / tool signals
-🐸 Meme — culture / ticker / no-product signals
-⚖️ Mixed — unclear from public text
+Labels: 🔧 Utility · 🐸 Meme · ⚖️ Mixed
 """
 
 
@@ -286,6 +283,18 @@ class DB:
                 url TEXT,
                 seen_at INTEGER NOT NULL,
                 alerted INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await self.c.commit()
+        await self.c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watch_snapshots (
+                user_id INTEGER NOT NULL,
+                project_id INTEGER NOT NULL,
+                snapshot_json TEXT,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, project_id)
             )
             """
         )
@@ -518,6 +527,43 @@ class DB:
             ORDER BY w.created_at DESC
             """,
             (user_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+    async def get_snapshot(self, user_id: int, pid: int) -> dict[str, Any] | None:
+        cur = await self.c.execute(
+            "SELECT snapshot_json FROM watch_snapshots WHERE user_id=? AND project_id=?",
+            (user_id, pid),
+        )
+        row = await cur.fetchone()
+        if not row or not row["snapshot_json"]:
+            return None
+        try:
+            return json.loads(row["snapshot_json"])
+        except Exception:
+            return None
+
+    async def save_snapshot(self, user_id: int, pid: int, snap: dict[str, Any]) -> None:
+        await self.c.execute(
+            """
+            INSERT INTO watch_snapshots(user_id, project_id, snapshot_json, updated_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id, project_id) DO UPDATE SET
+                snapshot_json=excluded.snapshot_json,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, pid, json.dumps(snap), now()),
+        )
+        await self.c.commit()
+
+    async def all_watches(self) -> list[dict[str, Any]]:
+        cur = await self.c.execute(
+            """
+            SELECT w.user_id, w.project_id, p.*
+            FROM watches w
+            JOIN projects p ON p.id = w.project_id
+            """
         )
         return [dict(r) for r in await cur.fetchall()]
 
@@ -1342,6 +1388,53 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
 
 # ---------- reports ----------
 
+
+def project_snapshot(p: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "website": p.get("website") or "",
+        "twitter": p.get("twitter") or "",
+        "telegram": p.get("telegram") or "",
+        "discord": p.get("discord") or "",
+        "docs": p.get("docs") or "",
+        "description": (p.get("description") or "")[:200],
+        "liquidity_usd": float(p.get("liquidity_usd") or 0),
+        "volume_24h": float(p.get("volume_24h") or 0),
+        "market_cap": float(p.get("market_cap") or 0),
+        "qualified": int(p.get("qualified") or 0),
+    }
+
+
+def snapshot_diffs(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    signals: list[str] = []
+    for field, label in (
+        ("website", "Website appeared"),
+        ("twitter", "X / Twitter appeared"),
+        ("telegram", "Telegram appeared"),
+        ("discord", "Discord appeared"),
+        ("docs", "Docs appeared"),
+    ):
+        if new.get(field) and not old.get(field):
+            signals.append(f"📡 {label}")
+    old_liq = float(old.get("liquidity_usd") or 0)
+    new_liq = float(new.get("liquidity_usd") or 0)
+    if old_liq < 500 and new_liq >= 2000:
+        signals.append(f"💧 Liquidity started (${new_liq:,.0f})")
+    elif old_liq > 0 and new_liq >= old_liq * 2.5 and new_liq - old_liq >= 3000:
+        signals.append(f"💧 Liquidity jumped {old_liq:,.0f} → {new_liq:,.0f}")
+    old_vol = float(old.get("volume_24h") or 0)
+    new_vol = float(new.get("volume_24h") or 0)
+    if old_vol < 1000 and new_vol >= 5000:
+        signals.append(f"📊 Trading activity started (vol ${new_vol:,.0f})")
+    elif old_vol > 0 and new_vol >= old_vol * 3 and new_vol - old_vol >= 10000:
+        signals.append(f"📊 Volume spike {old_vol:,.0f} → {new_vol:,.0f}")
+    if len(new.get("description") or "") > 40 and len(old.get("description") or "") < 20:
+        signals.append("📝 Project description filled in")
+    if new.get("qualified") and not old.get("qualified"):
+        signals.append("✅ Became public-facing (website or socials)")
+    return signals
+
+
+
 def classify_project(p: dict[str, Any]) -> dict[str, Any]:
     """Heuristic: utility vs meme vs mixed. Not financial advice — for job-hunt triage."""
     name = str(p.get("name") or "").lower()
@@ -1668,6 +1761,7 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("⛓ On-chain", callback_data=f"oc:{pid}"),
+            InlineKeyboardButton("🔍 Gaps", callback_data=f"gp:{pid}"),
         ],
     ]
     links: list[InlineKeyboardButton] = []
@@ -2096,11 +2190,42 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message or not update.effective_user:
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /watch <id>")
+        await update.effective_message.reply_text(
+            "Usage:\\n/watch <project_id>\\n/watch <CA>\\n/watch chain:CA\\n\\n"
+            "Scout will keep monitoring and alert when socials, liquidity, or activity appear — even while you are offline."
+        )
         return
-    db, _ = deps(context)
-    await db.watch(update.effective_user.id, int(context.args[0]))
-    await update.effective_message.reply_text("Watching. See /watchlist")
+    db, client = deps(context)
+    query = " ".join(context.args).strip()
+    project = None
+    if query.isdigit():
+        project = await db.by_id(int(query))
+    if not project:
+        project = await resolve_project(db, client, query, context.bot)
+    if not project:
+        await update.effective_message.reply_text(
+            "Could not resolve that id/CA. Try /project chain:address first, then /watch <id>."
+        )
+        return
+    await db.watch(update.effective_user.id, int(project["id"]))
+    snap = project_snapshot(project)
+    await db.save_snapshot(update.effective_user.id, int(project["id"]), snap)
+    chain = (project.get("chain") or "?").upper()
+    missing = []
+    if not project.get("telegram"):
+        missing.append("Telegram")
+    if not project.get("twitter"):
+        missing.append("X")
+    if not project.get("website"):
+        missing.append("Website")
+    miss = ", ".join(missing) if missing else "none (already public-facing)"
+    await update.effective_message.reply_html(
+        f"⭐ <b>Watching</b> #{project['id']} {esc(title_of(project))}\\n"
+        f"⛓ {esc(chain)}\\n"
+        f"Monitoring for: socials · liquidity · volume · profile changes\\n"
+        f"Still missing: {esc(miss)}\\n"
+        f"See /watchlist · alerts stay queued while you are offline."
+    )
 
 
 async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2120,12 +2245,29 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     db, _ = deps(context)
     rows = await db.watchlist(update.effective_user.id)
     if not rows:
-        await update.effective_message.reply_text("Watchlist empty. Tap ⭐ Watch on a report.")
+        await update.effective_message.reply_text(
+            "Watchlist empty.\n/watch <CA> or /watch <id> — or tap ⭐ Watch on a report."
+        )
         return
-    lines = ["⭐ <b>WATCHLIST</b>"] + [
-        f"#{p['id']} {esc(title_of(p))} · {esc((p.get('chain') or '').title())}" for p in rows
-    ]
-    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True)
+    lines = ["⭐ <b>WATCHLIST</b>", "Alerts fire on socials · liquidity · volume · profile changes", ""]
+    for p in rows:
+        kind = classify_project(p)
+        miss = []
+        if not p.get("telegram"):
+            miss.append("TG")
+        if not p.get("twitter"):
+            miss.append("X")
+        if not p.get("website"):
+            miss.append("web")
+        miss_s = ",".join(miss) if miss else "complete"
+        lines.append(
+            f"#{p['id']} <b>{esc(title_of(p))}</b> · {esc((p.get('chain') or '').title())} · {kind['label']}\n"
+            f"💧 {esc(money(p.get('liquidity_usd')))} · missing: {esc(miss_s)}"
+        )
+    markup = list_keyboard(rows[:8], now() - 86400, 0, len(rows)) if rows else None
+    await update.effective_message.reply_html(
+        "\n".join(lines), disable_web_page_preview=True, reply_markup=markup
+    )
 
 
 async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2255,6 +2397,26 @@ async def cb_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         log.warning("edit shuffle failed: %s", exc)
 
 
+async def cb_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
+        return
+    await update.callback_query.answer("Analyzing gaps…")
+    pid = int(update.callback_query.data.split(":")[1])
+    db, client = deps(context)
+    project = await db.by_id(pid)
+    if not project:
+        await update.callback_query.answer("Expired button. Open /jobs again.", show_alert=True)
+        return
+    project = await enrich_one(db, client, project, context.bot)
+    text = await gaps_text(project)
+    try:
+        await update.callback_query.edit_message_text(
+            text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=report_keyboard(project)
+        )
+    except Exception as exc:
+        log.warning("edit gaps failed: %s", exc)
+
+
 async def cb_onchain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
@@ -2361,6 +2523,54 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ---------- background loops ----------
 
+
+
+async def monitor_watches(app: Application) -> None:
+    """Compare watched project snapshots and alert on meaningful changes."""
+    db: DB = app.bot_data["db"]
+    client: httpx.AsyncClient = app.bot_data["http"]
+    rows = await db.all_watches()
+    if not rows:
+        return
+    # dedupe project enrich
+    seen_pids: set[int] = set()
+    for row in rows:
+        uid = int(row["user_id"])
+        pid = int(row["project_id"])
+        if pid not in seen_pids:
+            seen_pids.add(pid)
+            try:
+                await enrich_one(db, client, row, app.bot)
+            except Exception:
+                log.exception("watch enrich failed %s", pid)
+        fresh = await db.by_id(pid)
+        if not fresh:
+            continue
+        new_snap = project_snapshot(fresh)
+        old_snap = await db.get_snapshot(uid, pid) or {}
+        diffs = snapshot_diffs(old_snap, new_snap) if old_snap else []
+        await db.save_snapshot(uid, pid, new_snap)
+        if not diffs:
+            continue
+        chain = (fresh.get("chain") or "?").upper()
+        text = (
+            f"⭐ <b>WATCH ALERT ({esc(chain)})</b>\\n"
+            f"#{pid} {esc(title_of(fresh))}\\n"
+            + "\\n".join(esc(d) for d in diffs)
+            + f"\\n\\n💧 {esc(money(fresh.get('liquidity_usd')))} · 📊 {esc(money(fresh.get('volume_24h')))}"
+        )
+        try:
+            await app.bot.send_message(
+                chat_id=uid,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=report_keyboard(fresh),
+            )
+        except Exception as exc:
+            log.warning("watch alert failed uid=%s: %s", uid, exc)
+
+
 async def discovery_once(app: Application) -> None:
     db: DB = app.bot_data["db"]
     client: httpx.AsyncClient = app.bot_data["http"]
@@ -2452,6 +2662,7 @@ async def discovery_once(app: Application) -> None:
                 await db.mark_enriched(item["id"])
 
     await send_alerts(app)
+    await monitor_watches(app)
 
 
 async def send_alerts(app: Application) -> None:
@@ -2575,6 +2786,97 @@ async def on_stop(app: Application) -> None:
 
 
 
+
+
+async def cmd_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /gaps <project_id>   or /gaps <CA>")
+        return
+    db, client = deps(context)
+    query = " ".join(context.args).strip()
+    project = await db.by_id(int(query)) if query.isdigit() else None
+    if not project:
+        project = await resolve_project(db, client, query, context.bot)
+    if not project:
+        await update.effective_message.reply_text("Project not found.")
+        return
+    project = await enrich_one(db, client, project, context.bot)
+    text = await gaps_text(project)
+    await update.effective_message.reply_html(
+        text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
+    )
+
+
+async def gaps_text(p: dict[str, Any]) -> str:
+    s = score_project(p)
+    comm = community(p)
+    kind = classify_project(p)
+    what = p.get("description") or comm.get("site_about") or "No description."
+    tweets = comm.get("x_tweets") or []
+    tweet_blob = "\\n".join(f"- {(t.get('text') or '')[:140]}" for t in tweets[:5]) or "No recent X posts indexed."
+    prompt = (
+        f"You are a critical product reviewer for a Web3 community operator (NOT a trader).\\n"
+        f"Project: {title_of(p)}\\nChain: {p.get('chain')}\\nType label: {kind['label']}\\n"
+        f"Website: {p.get('website')}\\nX: {p.get('twitter')}\\nTelegram: {p.get('telegram')}\\nDocs: {p.get('docs')}\\n"
+        f"Site title: {comm.get('site_title')}\\nAbout: {what}\\n"
+        f"TG about: {comm.get('tg_about')}\\nTG members: {comm.get('tg_members')}\\n"
+        f"Recent X posts:\\n{tweet_blob}\\n\\n"
+        f"Write a GAP & RISK brief. Use these exact section headers:\\n"
+        f"PRODUCT GAPS\\nCOMMUNITY GAPS\\nSOCIAL / X GAPS\\nTRUST / RISK FLAGS\\nWHAT WOULD MAKE THIS STRONGER\\n"
+        f"Each section: 2-4 short bullets. Be specific to THIS project. No price predictions. No 'buy' language.\\n"
+        f"If data is thin, say what is missing. Seed {random.randint(1,9999)}."
+    )
+    generated = await llm_write(prompt)
+    header = [
+        "🔍 <b>GAP & RISK ANALYSIS</b>",
+        f"<b>{esc(title_of(p))}</b> · {kind['label']} · {s['band']} {s['score']}/100",
+        f"⛓ {esc((p.get('chain') or '?').title())}",
+        "",
+    ]
+    if generated:
+        body = [esc(generated)]
+        # soft format lines
+        body = []
+        for line in generated.splitlines():
+            t = line.strip()
+            up = t.upper().rstrip(":")
+            if up in {"PRODUCT GAPS", "COMMUNITY GAPS", "SOCIAL / X GAPS", "TRUST / RISK FLAGS", "WHAT WOULD MAKE THIS STRONGER"}:
+                body.append(f"<b>{esc(t)}</b>")
+            elif t.startswith("-") or t.startswith("•"):
+                body.append(f"• {esc(t.lstrip('-• ').strip())}")
+            elif t:
+                body.append(esc(t))
+            else:
+                body.append("")
+    else:
+        body = [
+            f"⚠️ AI offline — heuristic only · {esc(KEY_STATUS.get('groq') or KEY_STATUS.get('openrouter') or 'no key')}",
+            "",
+            "<b>PRODUCT GAPS</b>",
+            "• " + ("No docs linked" if not p.get("docs") else "Docs present — still verify clarity"),
+            "• " + ("No website" if not p.get("website") else "Website exists — check if product is usable"),
+            "• " + ("Description thin" if len(str(p.get("description") or "")) < 40 else "Has a description"),
+            "",
+            "<b>COMMUNITY GAPS</b>",
+            "• " + ("No Telegram" if not p.get("telegram") else f"Telegram linked ({esc(comm.get('tg_members') or '?')} members)"),
+            "• " + ("No Discord" if not p.get("discord") else "Discord linked"),
+            "",
+            "<b>SOCIAL / X GAPS</b>",
+            "• " + ("No X account" if not p.get("twitter") else "X linked — review post quality manually"),
+            "",
+            "<b>TRUST / RISK FLAGS</b>",
+            "• Early project — treat claims as unverified",
+            "• " + ("Thin liquidity" if (p.get("liquidity_usd") or 0) < 5000 else "Liquidity present"),
+            "",
+            "<b>WHAT WOULD MAKE THIS STRONGER</b>",
+            "• Clear product path + FAQ pinned in chat",
+            "• Consistent official links in bio / website",
+        ]
+    return "\\n".join(header + body)
+
+
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ask the AI for persona replies to a community question.
     Usage: /ask <project_id> <your question or paste from TG>
@@ -2651,6 +2953,124 @@ async def ask_personas_text(p: dict[str, Any], question: str) -> str:
 
 
 
+
+async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """CoinGecko trending — public, no key required."""
+    if not await gate(update, context) or not update.effective_message:
+        return
+    client = context.application.bot_data["http"]
+    lines = [
+        "🦎 <b>COINGECKO TRENDING</b>",
+        "Public endpoint · no API key required",
+        "",
+    ]
+    try:
+        resp = await client.get(
+            "https://api.coingecko.com/api/v3/search/trending",
+            timeout=20,
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code == 429:
+            await update.effective_message.reply_text(
+                "CoinGecko rate limit (public pool). Try again in a minute."
+            )
+            return
+        if resp.status_code >= 400:
+            await update.effective_message.reply_text(f"CoinGecko HTTP {resp.status_code}")
+            return
+        data = resp.json()
+        coins = data.get("coins") or []
+        if not coins:
+            lines.append("No trending coins returned.")
+        for i, item in enumerate(coins[:15], 1):
+            c = item.get("item") or {}
+            lines.append(
+                f"{i}. <b>{esc(c.get('name') or '?')}</b> ({esc(c.get('symbol') or '')})\n"
+                f"rank {esc(c.get('market_cap_rank') or '—')} · score {esc(c.get('score'))}"
+            )
+        lines.append("")
+        lines.append("Tip: /project &lt;CA&gt; to investigate a contract.")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"CoinGecko failed: {exc}")
+        return
+    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """CoinMarketCap newest listings — public data-api, no key required."""
+    if not await gate(update, context) or not update.effective_message:
+        return
+    client = context.application.bot_data["http"]
+    lines = [
+        "📈 <b>COINMARKETCAP NEW LISTINGS</b>",
+        "Public endpoint · sorted by date added · no API key required",
+        "",
+    ]
+    try:
+        resp = await client.get(
+            "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/listing",
+            params={
+                "start": 1,
+                "limit": 15,
+                "sortBy": "date_added",
+                "sortType": "asc",
+                "convert": "USD",
+                "cryptoType": "all",
+                "tagType": "all",
+            },
+            timeout=25,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (compatible; Web3ProjectScout/1.0)",
+            },
+        )
+        if resp.status_code >= 400:
+            # fallback public pro path
+            resp = await client.get(
+                "https://pro-api.coinmarketcap.com/public-api/v3/cryptocurrency/listings/latest",
+                params={"start": 1, "limit": 15, "convert": "USD"},
+                timeout=20,
+            )
+        if resp.status_code >= 400:
+            await update.effective_message.reply_text(f"CMC HTTP {resp.status_code}")
+            return
+        payload = resp.json()
+        data = payload.get("data")
+        items: list[dict[str, Any]] = []
+        if isinstance(data, dict) and "cryptoCurrencyList" in data:
+            items = data.get("cryptoCurrencyList") or []
+        elif isinstance(data, list):
+            items = data
+        for i, c in enumerate(items[:12], 1):
+            name = c.get("name") or "?"
+            sym = c.get("symbol") or ""
+            added = c.get("dateAdded") or c.get("date_added") or "—"
+            if isinstance(added, str) and "T" in added:
+                added = added.split("T")[0]
+            price = None
+            quotes = c.get("quotes")
+            if isinstance(quotes, list) and quotes:
+                price = quotes[0].get("price")
+            elif isinstance(quotes, dict):
+                price = (quotes.get("USD") or {}).get("price")
+            q = c.get("quote") or {}
+            if price is None and isinstance(q, dict):
+                price = (q.get("USD") or {}).get("price")
+            lines.append(
+                f"{i}. <b>{esc(name)}</b> ({esc(sym)})\n"
+                f"added {esc(added)} · {esc(money(price) if price is not None else '—')}"
+            )
+        if not items:
+            lines.append("No rows returned.")
+        lines.append("")
+        lines.append("Tip: /project &lt;CA&gt; after you find a contract on-chain.")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"CMC failed: {exc}")
+        return
+    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True)
+
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -2682,12 +3102,16 @@ def main() -> None:
     app.add_handler(CommandHandler("approach", cmd_approach))
     app.add_handler(CommandHandler("early", cmd_early))
     app.add_handler(CommandHandler("ask", cmd_ask))
+    app.add_handler(CommandHandler("gaps", cmd_gaps))
+    app.add_handler(CommandHandler("cg", cmd_cg))
+    app.add_handler(CommandHandler("cmc", cmd_cmc))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(cb_newtokens, pattern=r"^nt:"))
     app.add_handler(CallbackQueryHandler(cb_investigate, pattern=r"^inv:"))
     app.add_handler(CallbackQueryHandler(cb_approach, pattern=r"^ap:"))
     app.add_handler(CallbackQueryHandler(cb_shuffle, pattern=r"^sh:"))
     app.add_handler(CallbackQueryHandler(cb_onchain, pattern=r"^oc:"))
+    app.add_handler(CallbackQueryHandler(cb_gaps, pattern=r"^gp:"))
     app.add_handler(CallbackQueryHandler(cb_watch, pattern=r"^w:"))
     log.info("Polling Telegram…")
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
