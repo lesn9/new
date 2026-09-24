@@ -1,4 +1,4 @@
-"""Web3 Project Scout — single-file Telegram bot (fixed 2026-09-24)."""
+"""Web3 Project Scout — single-file Telegram bot (2026-09-24 persona + risk overhaul)."""
 
 from __future__ import annotations
 
@@ -145,38 +145,67 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-24-fixed-kind-geckorate"
+SCOUT_BUILD = "2026-09-24-persona-risk-overhaul-v2"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
 Finds early public-facing projects and stores them while you sleep.
 
 /newtokens [6h|12h|24h|3d] — catch-up list
-/project &lt;CA or chain:CA&gt; — full report + Approach / On-chain
+/project &lt;CA or chain:CA&gt; — full report
 /jobs — opportunity shortlist
 /digest 12h — morning top picks
-/approach &lt;id&gt; — persona openers
+/persona &lt;id&gt; — generate post-ready messages in chosen voice
+/approach &lt;id&gt; — choose persona (Investor / Curious / Question / Bullish / Holder)
 /ask &lt;id&gt; &lt;question&gt; — persona replies to a TG question
-/gaps &lt;id&gt; — product / TG / X gap &amp; risk analysis
+/gaps &lt;id&gt; — researched product / TG / X gap analysis
+/risks &lt;id&gt; — researched risk brief + fixes
 /watch &lt;id or CA&gt; — monitor until socials / liquidity / activity appear
 /unwatch &lt;id&gt;
 /watchlist — your monitored projects
-/cg — newly listed on CoinGecko (needs COINGECKO_API_KEY optional)
-/cmc — market listings snapshot (needs CMC_API_KEY optional)
+/cg — CoinGecko trending
+/cmc — CMC new listings
 /early — social-first / thin liquidity
+/menu — command menu (inserts into chat)
 /alerts on|off
 /status
 
-Watch alerts (while you are offline too — Telegram delivers when you open the app):
+Watch alerts:
 📡 socials appeared · 💧 liquidity jump · 📊 volume spike · 📝 profile changed
 
 Labels: 🔧 Utility · 🐸 Meme · ⚖️ Mixed
 """
 
-
 KEY_STATUS: dict[str, str] = {
     "gemini": "not set", "x": "not set", "xai": "not set",
     "groq": "not set", "openrouter": "not set", "llm_error": "",
+}
+
+PERSONAS = {
+    "investor": {
+        "label": "💰 Investor",
+        "desc": "Actual crypto/Web3 investor who is either holding or looking to size in. Speak with confidence, conviction, financial interest, long-term thesis, scaling potential, and backing the team.",
+    },
+    "curious": {
+        "label": "👀 Curious Community",
+        "desc": "Curious community member reacting to recent news, tweets, website updates or Telegram discussions. Share observations, express genuine intrigue, ask natural follow-up thoughts.",
+    },
+    "question": {
+        "label": "❓ Question / Inquirer",
+        "desc": "Ask deep, specific questions about aspects NOT clearly answered on the website or docs (tokenomics edge-cases, mainnet timelines, tech trade-offs, partnerships, product details).",
+    },
+    "bullish": {
+        "label": "🚀 Bullish Community",
+        "desc": "Bullish community member who genuinely likes the project. Positive energy, culture fit, belief in the vision, without sounding like a paid shill or AI.",
+    },
+    "holder": {
+        "label": "💎 Holder",
+        "desc": "Someone who already holds the token. Speaks from skin-in-the-game perspective — updates, clarity needs, community health, product progress.",
+    },
+    "strategist": {
+        "label": "🧠 Strategist",
+        "desc": "Thoughtful operator offering useful, non-generic suggestions on community, content, or product clarity. Helpful without being pushy.",
+    },
 }
 
 
@@ -274,7 +303,6 @@ def parse_lookback(arg: str | None, last_check: int | None) -> tuple[int, str]:
 
 
 def is_qualified(row: dict[str, Any]) -> bool:
-    """True only when a public project identity exists (not contract-only)."""
     return bool(row.get("website") or row.get("twitter") or row.get("telegram") or row.get("discord"))
 
 
@@ -1087,9 +1115,10 @@ async def llm_write(prompt: str) -> str | None:
     xai = env_secret("XAI_API_KEY")
     oai = env_secret("OPENAI_API_KEY")
     system = (
-        "You write short, human crypto community comments. "
+        "You write short, human crypto community comments and analysis. "
         "No GM bullish. No investment advice. No fake claims. "
-        "Sound like a real person who actually read the project."
+        "Sound like a real person who actually read the project. "
+        "Never sound like an AI responding to a prompt."
     )
 
     if groq:
@@ -1111,8 +1140,8 @@ async def llm_write(prompt: str) -> str | None:
                         headers={"Authorization": f"Bearer {groq}", "Content-Type": "application/json"},
                         json={
                             "model": model,
-                            "temperature": 0.8,
-                            "max_tokens": 900,
+                            "temperature": 0.85,
+                            "max_tokens": 1100,
                             "messages": [
                                 {"role": "system", "content": system},
                                 {"role": "user", "content": prompt},
@@ -1121,7 +1150,6 @@ async def llm_write(prompt: str) -> str | None:
                     )
                     if resp.status_code >= 400:
                         KEY_STATUS["groq"] = f"{model} http {resp.status_code}"
-                        log.warning("Groq %s: %s", resp.status_code, (resp.text or "")[:200])
                         continue
                     text = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
                     if text:
@@ -1159,8 +1187,8 @@ async def llm_write(prompt: str) -> str | None:
                         },
                         json={
                             "model": model,
-                            "temperature": 0.8,
-                            "max_tokens": 900,
+                            "temperature": 0.85,
+                            "max_tokens": 1100,
                             "messages": [
                                 {"role": "system", "content": system},
                                 {"role": "user", "content": prompt},
@@ -1169,7 +1197,6 @@ async def llm_write(prompt: str) -> str | None:
                     )
                     if resp.status_code >= 400:
                         KEY_STATUS["openrouter"] = f"{model} http {resp.status_code}"
-                        log.warning("OpenRouter %s: %s", resp.status_code, (resp.text or "")[:200])
                         continue
                     text = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
                     if text:
@@ -1189,10 +1216,8 @@ async def llm_write(prompt: str) -> str | None:
             "gemini-2.5-flash",
             "gemini-2.0-flash",
             "gemini-1.5-flash",
-            "gemini-2.5-flash-lite",
         ]
         seen: set[str] = set()
-        last_err = ""
         try:
             async with httpx.AsyncClient(timeout=45) as client:
                 for model in models:
@@ -1206,24 +1231,17 @@ async def llm_write(prompt: str) -> str | None:
                         json={
                             "system_instruction": {"parts": [{"text": system}]},
                             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                            "generationConfig": {"temperature": 0.9, "maxOutputTokens": 900},
+                            "generationConfig": {"temperature": 0.9, "maxOutputTokens": 1100},
                         },
                     )
                     if resp.status_code >= 400:
-                        last_err = f"{model} http {resp.status_code}"
-                        log.warning("Gemini %s: %s", resp.status_code, (resp.text or "")[:240])
                         continue
                     parts = (((resp.json().get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
                     text = "".join(p.get("text") or "" for p in parts).strip()
                     if text:
-                        KEY_STATUS["llm_error"] = ""
                         KEY_STATUS["gemini"] = f"ok:{model}"
                         return text
-                    last_err = f"{model} empty"
-            KEY_STATUS["llm_error"] = last_err or "gemini empty"
-            KEY_STATUS["gemini"] = last_err or "failed"
         except Exception as exc:
-            KEY_STATUS["llm_error"] = str(exc)[:80]
             KEY_STATUS["gemini"] = "error"
             log.warning("Gemini failed: %s", exc)
     else:
@@ -1231,13 +1249,7 @@ async def llm_write(prompt: str) -> str | None:
 
     providers: list[tuple[str, str, str]] = []
     if xai:
-        for model in (
-            (os.getenv("XAI_MODEL") or "").strip(),
-            "grok-4.7",
-            "grok-4.6",
-            "grok-4.1-fast",
-            "grok-3-mini",
-        ):
+        for model in ((os.getenv("XAI_MODEL") or "").strip(), "grok-4.1-fast", "grok-3-mini"):
             if model:
                 providers.append(("xai", xai, model))
     if oai:
@@ -1247,54 +1259,30 @@ async def llm_write(prompt: str) -> str | None:
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             for kind, key, model in providers:
-                url = (
-                    "https://api.x.ai/v1/chat/completions"
-                    if kind == "xai"
-                    else "https://api.openai.com/v1/chat/completions"
-                )
+                url = "https://api.x.ai/v1/chat/completions" if kind == "xai" else "https://api.openai.com/v1/chat/completions"
                 resp = await client.post(
                     url,
                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                     json={
                         "model": model,
-                        "temperature": 0.7,
-                        "max_tokens": 900,
+                        "temperature": 0.8,
+                        "max_tokens": 1100,
                         "messages": [
                             {"role": "system", "content": system},
                             {"role": "user", "content": prompt},
                         ],
                     },
                 )
-                status_key = "xai" if kind == "xai" else "openai"
                 if resp.status_code >= 400:
-                    KEY_STATUS[status_key] = f"{model} http {resp.status_code}"
-                    log.warning("LLM %s %s: %s", kind, resp.status_code, (resp.text or "")[:200])
                     continue
                 text = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
                 if text:
-                    KEY_STATUS[status_key] = f"ok:{model}"
+                    KEY_STATUS["xai" if kind == "xai" else "openai"] = f"ok:{model}"
                     return text
         return None
     except Exception as exc:
         log.warning("LLM failed: %s", exc)
         return None
-
-
-async def guess_telegram(bot, project: dict[str, Any]) -> dict[str, Any]:
-    if project.get("telegram") or bot is None:
-        return {}
-    guesses: list[str] = []
-    name = re.sub(r"[^A-Za-z0-9]", "", str(project.get("name") or ""))
-    symbol = re.sub(r"[^A-Za-z0-9]", "", str(project.get("symbol") or ""))
-    for raw in (symbol, name, f"{name}portal", f"{symbol}portal", f"{name}chat"):
-        if raw and len(raw) >= 4:
-            guesses.append(raw)
-    for handle in guesses[:5]:
-        info = await fetch_telegram(bot, f"https://t.me/{handle}")
-        if info.get("tg_title"):
-            info["found_telegram"] = f"https://t.me/{handle}"
-            return info
-    return {}
 
 
 async def enrich_community(bot, client: httpx.AsyncClient, project: dict[str, Any]) -> dict[str, Any]:
@@ -1325,7 +1313,6 @@ async def enrich_community(bot, client: httpx.AsyncClient, project: dict[str, An
 
 
 async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> dict[str, Any]:
-    """Best-effort free on-chain extras."""
     out: dict[str, Any] = {}
     chain = (project.get("chain") or "").lower()
     addr = (project.get("token_address") or "").strip()
@@ -1352,13 +1339,11 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
                             pass
                     if data.get("score") is not None:
                         out["rugcheck_score"] = data.get("score")
-                    if data.get("score_normalised") is not None:
-                        out["rugcheck_score_norm"] = data.get("score_normalised")
                     if data.get("rugged") is not None:
                         out["rugged"] = data.get("rugged")
-                    top = data.get("topHolders") or []
-                    if top and isinstance(top, list):
-                        out["top_holders_n"] = len(top)
+                    # rough CTO heuristic: if top holders look community-like or mint revoked etc.
+                    if data.get("mintAuthority") is None and data.get("freezeAuthority") is None:
+                        out["mint_revoked"] = True
         except Exception as exc:
             log.warning("rugcheck failed %s: %s", addr[:12], exc)
 
@@ -1389,7 +1374,6 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
         "arbitrum": "https://arbitrum.blockscout.com",
         "polygon": "https://polygon.blockscout.com",
         "optimism": "https://optimism.blockscout.com",
-        "gnosis": "https://gnosis.blockscout.com",
     }
     if chain in blockscout and not out.get("holders"):
         base = blockscout[chain]
@@ -1405,6 +1389,19 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
             cdata = await http_get(client, f"{base}/api/v2/smart-contracts/{addr}")
             if isinstance(cdata, dict) and cdata.get("creator_address_hash"):
                 out["deployer"] = cdata["creator_address_hash"]
+
+    # Free honeypot check attempt for EVM (best-effort)
+    if chain in {"ethereum", "bsc", "base", "arbitrum", "polygon"} and addr.startswith("0x"):
+        try:
+            hp = await http_get(client, f"https://api.honeypot.is/v2/IsHoneypot?address={addr}")
+            if isinstance(hp, dict):
+                out["honeypot"] = hp.get("isHoneypot")
+                out["buy_tax"] = hp.get("buyTax")
+                out["sell_tax"] = hp.get("sellTax")
+                if hp.get("simulationSuccess") is not None:
+                    out["sim_ok"] = hp.get("simulationSuccess")
+        except Exception:
+            pass
 
     return out
 
@@ -1457,7 +1454,6 @@ def snapshot_diffs(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
 
 
 def classify_project(p: dict[str, Any]) -> dict[str, Any]:
-    """Heuristic: utility vs meme vs mixed. Not financial advice — for job-hunt triage."""
     name = str(p.get("name") or "").lower()
     symbol = str(p.get("symbol") or "").lower()
     desc = str(p.get("description") or "").lower()
@@ -1513,7 +1509,6 @@ def classify_project(p: dict[str, Any]) -> dict[str, Any]:
 
 
 def score_project(p: dict[str, Any]) -> dict[str, Any]:
-    """Heuristic score for community / social opportunity — not a trade call."""
     score = 0
     roles: list[str] = []
     age_ts = p.get("launched_at") or p.get("discovered_at")
@@ -1548,7 +1543,6 @@ def score_project(p: dict[str, Any]) -> dict[str, Any]:
     if comm.get("site_about") and not desc:
         score += 6
     kind = classify_project(p)
-    # FIXED: was kind["kind"] → KeyError. classify_project returns "type"
     if kind.get("type") == "utility":
         score += 14
         if "Utility / product" not in roles:
@@ -1608,47 +1602,6 @@ def score_project(p: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def opportunity_signals(p: dict[str, Any]) -> list[str]:
-    signals: list[str] = []
-    age_ts = p.get("launched_at") or p.get("discovered_at")
-    age_h = ((time.time() - age_ts) / 3600) if age_ts else None
-    socials = sum(1 for k in ("website", "twitter", "telegram", "discord", "docs") if p.get(k))
-    if age_h is not None and age_h < 24:
-        signals.append("Recently launched — early window to show up as a useful community voice")
-    if socials >= 3:
-        signals.append("Public-facing project. Teams like this often need community help")
-    if p.get("telegram") and not p.get("docs"):
-        signals.append("Has a chat but thin docs — FAQ / content work is a common gap")
-    if p.get("twitter") and not p.get("telegram"):
-        signals.append("On X but no obvious Telegram — community setup may be missing")
-    if (p.get("liquidity_usd") or 0) >= 10_000 and socials >= 2:
-        signals.append("Enough liquidity + presence that this is more than a throwaway mint")
-    if p.get("description") and len(str(p.get("description"))) > 40:
-        signals.append("Team wrote a real description — treat as a product, not only a ticker")
-    if not signals:
-        signals.append("Qualified by public links. Investigate before spending time.")
-    return signals[:5]
-
-
-def observations_for(p: dict[str, Any]) -> list[str]:
-    notes: list[str] = []
-    if not p.get("website"):
-        notes.append("No official website indexed yet")
-    if not p.get("twitter"):
-        notes.append("No X account linked")
-    if not p.get("telegram") and not p.get("discord"):
-        notes.append("No public community chat indexed")
-    if not p.get("docs"):
-        notes.append("No docs page found")
-    if not p.get("description"):
-        notes.append("No project description on the token profile")
-    if (p.get("liquidity_usd") or 0) and p.get("liquidity_usd") < 3000:
-        notes.append("Very thin liquidity — treat market numbers as noisy")
-    if not notes:
-        notes.append("Profile looks more complete than average new launch")
-    return notes[:6]
-
-
 def list_item(index: int, p: dict[str, Any]) -> str:
     s = score_project(p)
     kind = classify_project(p)
@@ -1676,19 +1629,19 @@ def list_keyboard(projects: list[dict[str, Any]], since_ts: int, offset: int, to
 
 
 def report_text(p: dict[str, Any]) -> str:
-    """Clean project intelligence dashboard."""
     what = p.get("description") or "No public description indexed yet."
     s = score_project(p)
     comm = community(p)
     kind = classify_project(p)
     badge = source_label(p)
+    launch_ts = p.get("launched_at") or p.get("discovered_at")
     lines = [
         "🧠 <b>PROJECT INTELLIGENCE</b>",
         f"<b>{esc(title_of(p))}</b>",
         f"{kind['label']}" + (f" · {badge}" if badge else ""),
         f"⛓ {(p.get('chain') or '?').title()}",
         f"🏷 <code>{esc(p.get('token_address') or '')}</code>",
-        f"🕒 {esc(ago(p.get('launched_at') or p.get('discovered_at')))}",
+        f"🕒 Launched: {esc(ago(launch_ts))}",
         f"🎯 {s['band']} {s['score']}/100",
         "",
         "💰 <b>MARKET</b>",
@@ -1740,8 +1693,8 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔄 Refresh", callback_data=f"inv:{pid}"),
         ],
         [
+            InlineKeyboardButton("🎭 Persona", callback_data=f"ps:{pid}"),
             InlineKeyboardButton("🎯 Approach", callback_data=f"ap:{pid}"),
-            InlineKeyboardButton("🔀 Shuffle", callback_data=f"sh:{pid}"),
         ],
         [
             InlineKeyboardButton("⛓ On-chain", callback_data=f"oc:{pid}"),
@@ -1771,8 +1724,27 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def persona_select_keyboard(pid: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("💰 Investor", callback_data=f"pn:{pid}:investor"),
+            InlineKeyboardButton("👀 Curious", callback_data=f"pn:{pid}:curious"),
+        ],
+        [
+            InlineKeyboardButton("❓ Question", callback_data=f"pn:{pid}:question"),
+            InlineKeyboardButton("🚀 Bullish", callback_data=f"pn:{pid}:bullish"),
+        ],
+        [
+            InlineKeyboardButton("💎 Holder", callback_data=f"pn:{pid}:holder"),
+            InlineKeyboardButton("🧠 Strategist", callback_data=f"pn:{pid}:strategist"),
+        ],
+        [InlineKeyboardButton("« Back to report", callback_data=f"inv:{pid}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 def onchain_text(p: dict[str, Any]) -> str:
-    """On-chain dashboard with risks + constructive suggestions."""
+    """Clean on-chain card. Only facts from available data."""
     comm = community(p)
     s = score_project(p)
     kind = classify_project(p)
@@ -1780,11 +1752,22 @@ def onchain_text(p: dict[str, Any]) -> str:
     vol = float(p.get("volume_24h") or 0)
     mcap = p.get("market_cap")
     holders = comm.get("holders")
+    launch_ts = p.get("launched_at") or p.get("discovered_at")
+    deployer = comm.get("deployer")
+
+    # CTO heuristic
+    cto = "UNKNOWN"
+    if kind.get("type") == "meme" and (comm.get("mint_revoked") or (holders and holders > 300 and not deployer)):
+        cto = "POSSIBLE"
+    if "cto" in str(p.get("name") or "").lower() or "community take" in str(p.get("description") or "").lower():
+        cto = "YES (self-described)"
+
     lines = [
         "⛓ <b>ON-CHAIN ANALYSIS</b>",
         f"<b>{esc(title_of(p))}</b> · {kind['label']}",
         f"⛓ {(p.get('chain') or '?').title()}",
         f"🏷 <code>{esc(p.get('token_address') or '')}</code>",
+        f"🕒 Deployed: <b>{esc(ago(launch_ts))}</b>",
         "",
         "💰 <b>MARKET</b>",
         f"MCAP: <b>{esc(money(mcap))}</b>",
@@ -1795,69 +1778,71 @@ def onchain_text(p: dict[str, Any]) -> str:
         f"DEX: {esc(p.get('dex') or '—')}",
         "",
         "👤 <b>CREATOR / HOLDERS</b>",
-        f"Deployer: <code>{esc(comm.get('deployer') or '—')}</code>",
+        f"Deployer: <code>{esc(deployer or '—')}</code>",
         f"Holders: <b>{esc(holders if holders is not None else '—')}</b>",
+        f"CTO Status: <b>{esc(cto)}</b>",
     ]
     if comm.get("pump_complete") is not None:
         lines.append(f"Pump.fun graduated: {'yes' if comm.get('pump_complete') else 'no'}")
-    if comm.get("pump_mcap") is not None:
-        lines.append(f"Pump mcap: {esc(money(to_float(comm.get('pump_mcap'))))}")
     if comm.get("rugcheck_score") is not None:
-        lines.append(f"Rugcheck score: {esc(comm.get('rugcheck_score'))} (lower usually safer)")
+        lines.append(f"Rugcheck score: {esc(comm.get('rugcheck_score'))}")
     if comm.get("rugged"):
         lines.append("⚠️ Rugcheck flagged rugged")
+    if comm.get("honeypot") is not None:
+        lines.append(f"Honeypot: {'YES ⚠️' if comm.get('honeypot') else 'No'}")
+    if comm.get("buy_tax") is not None or comm.get("sell_tax") is not None:
+        lines.append(f"Buy tax: {esc(comm.get('buy_tax'))} · Sell tax: {esc(comm.get('sell_tax'))}")
 
-    lines += ["", "⚠️ <b>ON-CHAIN RISK SIGNALS</b>"]
+    lines += ["", "⚠️ <b>OBSERVED ON-CHAIN SIGNALS</b>"]
     risks = []
     if liq and liq < 3000:
-        risks.append("Very thin liquidity — easy to move price; exit risk high.")
+        risks.append("Very thin liquidity — price easy to move, exit risk high.")
     elif liq and liq < 15000:
-        risks.append("Modest liquidity — size entries carefully.")
+        risks.append("Modest liquidity — size carefully.")
     if vol and liq and vol > liq * 5:
-        risks.append("Volume >> liquidity — possible wash or aggressive churn.")
+        risks.append("Volume >> liquidity — possible wash / aggressive churn.")
     if holders is not None and holders < 50:
-        risks.append(f"Low holder count ({holders}) — concentration / early distribution risk.")
+        risks.append(f"Low holder count ({holders}) — concentration risk.")
     elif holders is not None and holders < 200:
         risks.append(f"Holder base still small ({holders}).")
-    if not comm.get("deployer"):
-        risks.append("Deployer not indexed on free sources — verify manually on explorer.")
+    if not deployer:
+        risks.append("Deployer not indexed on free sources — verify on explorer.")
     if comm.get("rugged"):
-        risks.append("Automated rug flag present — treat as high risk until proven otherwise.")
+        risks.append("Automated rug flag present.")
+    if comm.get("honeypot"):
+        risks.append("Honeypot check returned positive — high risk.")
     if not risks:
-        risks.append("No strong automated red flags from free data — still verify LP lock, mint authority, tax.")
+        risks.append("No strong automated red flags from free data. Still verify LP lock, mint authority, tax on explorer.")
     for r in risks:
         lines.append(f"• {esc(r)}")
 
-    lines += ["", "💡 <b>WHAT WOULD HELP THE PROJECT</b>"]
+    lines += ["", "💡 <b>WHAT WOULD HELP (from observed data only)</b>"]
     tips = []
-    if kind.get("type") == "meme" or "meme" in str(kind.get("label") or "").lower():
-        tips = [
-            "Publish clear buy links + official CA in one pinned place.",
-            "Show LP status (locked/burned) in plain language for the community.",
-            "Keep one consistent narrative (meme lore) across X + TG — less scatter.",
-            "Avoid fake 'utility' claims; lean into culture, transparency, and fun.",
-        ]
-    else:
-        tips = [
-            "Surface contract addresses + chain on the site header.",
-            "Explain mint / upgrade / admin powers in one short trust page.",
-            "If LP is locked or renounced, state it clearly with proof links.",
-            "Show real product usage (screens, metrics) next to token stats.",
-        ]
     if liq and liq < 10000:
-        tips.append("Deeper liquidity reduces volatility that scares serious size.")
+        tips.append("Deeper liquidity would reduce volatility that scares serious size.")
+    if holders is not None and holders < 150:
+        tips.append("Broader holder distribution reduces concentration risk narrative.")
+    if not deployer:
+        tips.append("Publishing verified deployer + LP status in one official place builds trust.")
+    if kind.get("type") == "meme":
+        tips.append("Clear pinned CA + buy path + LP status in TG/X reduces FUD loops.")
+    else:
+        tips.append("Contract addresses + admin power explanation on site header reduces diligence friction.")
+    if not tips:
+        tips.append("No additional on-chain derived suggestions from available free data.")
     for t in tips:
         lines.append(f"• {esc(t)}")
 
     lines += [
         "",
         f"🎯 Opportunity: {s['band']} {s['score']}/100",
-        "<i>Free data is incomplete on many chains — always cross-check explorer.</i>",
+        "<i>Free data is incomplete — always cross-check explorer + official channels.</i>",
     ]
     return "\n".join(lines)
 
 
-async def approach_text(p: dict[str, Any]) -> str:
+async def persona_text(p: dict[str, Any], persona_key: str = "curious") -> str:
+    """Generate human, post-ready messages in a specific persona voice."""
     s = score_project(p)
     comm = community(p)
     what = p.get("description") or comm.get("site_about") or comm.get("tg_about") or "Thin public description."
@@ -1866,112 +1851,104 @@ async def approach_text(p: dict[str, Any]) -> str:
     has_tg = bool(p.get("telegram"))
     has_x = bool(p.get("twitter"))
     door = "X only" if has_x and not has_tg else ("Telegram + X" if has_tg and has_x else ("Telegram" if has_tg else "thin socials"))
+    persona = PERSONAS.get(persona_key, PERSONAS["curious"])
+    kind = classify_project(p)
+
     prompt = (
-        f"Project: {title_of(p)}\nChain: {p.get('chain')}\n"
+        f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
         f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTelegram: {p.get('telegram')}\n"
-        f"Site title: {comm.get('site_title')}\nAbout: {what}\n"
-        f"TG about: {comm.get('tg_about')}\nRecent X posts:\n{tweet_blob}\n"
-        f"Write a brief for a community operator. Door is: {door}.\n"
-        f"If only X exists, write REPLY-ready comments to their recent posts or a DM opener. "
-        f"If Telegram exists, write chat replies too.\n"
-        f"Use these labels exactly, each 1-2 sentences, human, specific to THIS product:\n"
-        f"CURIOUS\nINVESTOR\nSUGGESTION\nQUESTION\nSUPPORTER\nSTRATEGIST\nRANDOM\n"
-        f"No hashtags dump. No 'to the moon'. Variation seed {random.randint(1, 9999)} — write a FRESH set."
+        f"About: {what}\nSite title: {comm.get('site_title')}\nTG about: {comm.get('tg_about')}\n"
+        f"Recent X posts:\n{tweet_blob}\n"
+        f"Door available: {door}\n\n"
+        f"PERSONA TO ADOPT (strict):\n{persona['label']}: {persona['desc']}\n\n"
+        f"Write 4-6 short, ready-to-post messages this persona would actually send.\n"
+        f"Rules:\n"
+        f"- Sound 100% human. No AI cadence. No 'As an investor...' meta talk.\n"
+        f"- Each message must stand alone and be postable on X or Telegram.\n"
+        f"- Include 2-3 options that work as X replies or DM openers if only X exists.\n"
+        f"- For DM openers: make interest + questions convincing enough that the team might invite a DM or accept one. "
+        f"Sound like you've used the product or done real diligence and want to dig further.\n"
+        f"- No hashtags dump. No 'to the moon'. Variation seed {random.randint(1,9999)}.\n"
+        f"Format exactly:\nOPTION 1\n<option text>\nOPTION 2\n<option text>\n... "
     )
     generated = await llm_write(prompt)
+
     header = [
-        "🎯 <b>APPROACH BRIEF</b>",
+        f"🎭 <b>PERSONA · {esc(persona['label'])}</b>",
         f"<b>{esc(title_of(p))}</b> · {s['band']} {s['score']}/100",
         f"⛓ {esc((p.get('chain') or '?').title())} · Door: {esc(door)}",
         "",
-        "📌 <b>What they appear to be</b>",
-        esc(what)[:400],
+        "📌 Context",
+        esc(what)[:300],
         "",
-        "💼 <b>Why you might be useful</b>",
-        f"Roles: {esc(', '.join(s['roles']))}",
     ]
     if generated:
-        body = ["", copyable_brief(generated)]
+        body = [copyable_brief(generated)]
     else:
-        name = esc(title_of(p))
-        about = esc(what)[:80]
-        packs = [
-            [
-                "<b>CURIOUS</b>",
-                f"Just landed on {name}. {about} — how does a first-time user actually try this today?",
-                "<b>INVESTOR</b>",
-                "Not asking for a price call. Who is the user that pays, and what do they get that a meme page does not?",
-                "<b>SUGGESTION</b>",
-                "Pin a 3-line 'how this works' so the chat stops repeating the same setup questions.",
-                "<b>QUESTION</b>",
-                "Is the product live for anyone, or still waitlist / friends-and-family?",
-                "<b>SUPPORTER</b>",
-                f"The positioning on {name} is clearer than most launches this week. Keep posting the actual use, not candles.",
-                "<b>STRATEGIST</b>",
-                "I can turn the site copy into FAQ replies for the first week if you want a cleaner chat.",
-                "<b>RANDOM</b>",
-                "Ok wait. So this is less 'number go up' and more a product people are supposed to open daily?",
-            ],
-            [
-                "<b>CURIOUS</b>",
-                f"Saw {name} on Dex and then the X. What's the one action you want a new person to take in the first 5 minutes?",
-                "<b>INVESTOR</b>",
-                "If I ignore the chart: what's the loop that brings someone back after day one?",
-                "<b>SUGGESTION</b>",
-                "A short clip walking through one real use would beat another slogan post.",
-                "<b>QUESTION</b>",
-                "Where should a confused holder ask questions — X replies or the Telegram?",
-                "<b>SUPPORTER</b>",
-                "This reads like a team that knows the joke. Don't bury the actual mechanic under memes.",
-                "<b>STRATEGIST</b>",
-                "Happy to draft reply templates for the 5 questions every new token chat gets.",
-                "<b>RANDOM</b>",
-                "Be honest — is this something I open, or something I just hold?",
-            ],
-            [
-                "<b>CURIOUS</b>",
-                f"{name} clicked because the line isn't generic. Who is this actually for?",
-                "<b>INVESTOR</b>",
-                "What's already shipped vs what's still a screenshot?",
-                "<b>SUGGESTION</b>",
-                "Put official links in the Telegram description so people stop asking for the CA.",
-                "<b>QUESTION</b>",
-                "Any public doc or FAQ besides the X bio?",
-                "<b>SUPPORTER</b>",
-                "Following. Will share if the product demo is as clean as the copy.",
-                "<b>STRATEGIST</b>",
-                "If you want, I can sit in the chat this week and answer newbie questions from the site text.",
-                "<b>RANDOM</b>",
-                "This might be the first ticker today that tried to explain itself. Respect.",
-            ],
-        ]
-        chosen = packs[random.randint(0, len(packs) - 1)]
-        wrapped = []
-        for line in chosen:
-            if line.startswith("<b>"):
-                wrapped.append(line)
-            else:
-                wrapped.append(f"<code>{line}</code>")
-        body = [
-            "",
-            f"⚠️ AI fallback · Gemini {esc(KEY_STATUS.get('gemini') or '?')} · xAI {esc(KEY_STATUS.get('xai') or 'not tried')}",
-            "Tap a grey line to copy. Shuffle for another set.",
-            "",
-        ] + wrapped
-        if tweets:
-            body += ["", "<b>Reply to their latest X</b>", esc((tweets[0].get("text") or "")[:160])]
-    extra = ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}", "Tap 🔀 Shuffle for a new set."]
+        # strong human fallbacks per persona
+        name = title_of(p)
+        if persona_key == "investor":
+            opts = [
+                f"Been watching {name} for a bit. The positioning feels clearer than most launches this week — what's the actual retention loop after day one?",
+                f"Looking at sizing a position here. Who is the user that pays if the token didn't exist?",
+                f"Thesis so far looks solid on paper. Any public numbers on usage or waitlist conversion yet?",
+            ]
+        elif persona_key == "question":
+            opts = [
+                f"Quick one on {name} — is the product live for anyone outside friends-and-family, or still closed?",
+                "Where should someone dig into the admin / upgrade powers on the contracts? Not seeing it spelled out clearly.",
+                "Token capture vs product value still fuzzy to me. Is there a short doc on that?",
+            ]
+        elif persona_key == "bullish":
+            opts = [
+                f"This is one of the cleaner narratives I've seen this week. Keeping an eye on {name}.",
+                "Finally a project that tries to explain itself instead of just posting candles. Respect.",
+                f"Culture + clarity on {name} is rare lately. Following.",
+            ]
+        elif persona_key == "holder":
+            opts = [
+                f"Holding {name}. Would love a pinned 'how this works' so the chat stops looping the same questions.",
+                "As a holder — any timeline clarity on the next public milestone?",
+                "In from early. The more transparent the LP + admin status, the easier it is to stay long.",
+            ]
+        elif persona_key == "strategist":
+            opts = [
+                "Happy to draft a short FAQ from the site copy if it helps the first-week chat stay clean.",
+                "One suggestion: put official links + CA in the Telegram description so people stop asking.",
+                "If useful I can sit in the chat this week and answer newbie questions from the public docs.",
+            ]
+        else:  # curious
+            opts = [
+                f"Just landed on {name} via Dex → X. How does a first-time user actually try this in the first 5 minutes?",
+                "The site copy clicked more than the average launch. What's the one action you want new people to take?",
+                "Saw the recent posts. Is the product something people open daily or more of a hold?",
+            ]
+        body = []
+        for i, o in enumerate(opts, 1):
+            body.append(f"<b>OPTION {i}</b>")
+            body.append(f"<code>{esc(o)}</code>")
+            body.append("")
+        body.append(f"⚠️ AI offline · {esc(KEY_STATUS.get('groq') or KEY_STATUS.get('openrouter') or 'no key')}")
+
+    extra = [
+        "",
+        f"X: {esc(p.get('twitter') or '—')}",
+        f"TG: {esc(p.get('telegram') or '—')}",
+        "Tap another persona below or 🔀 for a fresh set.",
+    ]
     return "\n".join(header + body + extra)
 
 
 def copyable_brief(text: str) -> str:
-    labels = {"CURIOUS", "INVESTOR", "SUGGESTION", "QUESTION", "SUPPORTER", "STRATEGIST", "RANDOM"}
+    labels = {"CURIOUS", "INVESTOR", "SUGGESTION", "QUESTION", "SUPPORTER", "STRATEGIST", "RANDOM",
+              "OPTION1", "OPTION2", "OPTION3", "OPTION4", "OPTION5", "OPTION6",
+              "OPTION 1", "OPTION 2", "OPTION 3", "OPTION 4", "OPTION 5", "OPTION 6"}
     out: list[str] = []
     for raw in (text or "").splitlines():
         line = raw.strip()
-        key = re.sub(r"[^A-Za-z]", "", line).upper()
-        if key in labels:
-            out.append(f"<b>{esc(key)}</b>")
+        key = re.sub(r"[^A-Za-z0-9 ]", "", line).upper().strip()
+        if key in labels or key.startswith("OPTION"):
+            out.append(f"<b>{esc(line)}</b>")
         elif line:
             out.append(f"<code>{esc(line)}</code>")
         else:
@@ -1980,10 +1957,10 @@ def copyable_brief(text: str) -> str:
 
 
 def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
-    """Social update — especially Telegram group creation after X/site only."""
     chain = (p.get("chain") or "?").upper()
     kind = classify_project(p)
     src_badge = source_label(p, for_alert=True)
+    launch_ts = p.get("launched_at") or p.get("discovered_at")
     head = f"🔔 <b>SOCIAL UPDATE ({esc(chain)})</b>"
     if src_badge:
         head += f" · {src_badge}"
@@ -1991,14 +1968,11 @@ def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
         head,
         f"<b>{esc(title_of(p))}</b> · {kind['label']}",
         f"Contract: <code>{esc(p.get('token_address') or '—')}</code>",
+        f"Deployed: {esc(ago(launch_ts))}",
         "",
     ]
     if "telegram" in kinds and p.get("telegram"):
-        lines += [
-            "💬 <b>TELEGRAM GROUP CREATED / DETECTED</b>",
-            esc(str(p.get("telegram"))),
-            "",
-        ]
+        lines += ["💬 <b>TELEGRAM GROUP DETECTED</b>", esc(str(p.get("telegram"))), ""]
     if "x" in kinds and p.get("twitter"):
         lines += ["𝕏 <b>X DETECTED</b>", esc(str(p.get("twitter"))), ""]
     if "website" in kinds and p.get("website"):
@@ -2006,17 +1980,17 @@ def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
     lines += [
         f"💰 MCAP: <b>{esc(money(p.get('market_cap')))}</b> · 💧 {esc(money(p.get('liquidity_usd')))}",
         f"Channels: {esc(', '.join(k.upper() for k in kinds))}",
-        f"First seen: {esc(ago(p.get('discovered_at')))}",
+        f"First seen by Scout: {esc(ago(p.get('discovered_at')))}",
     ]
     return "\n".join(lines)
 
 
 def alert_text(p: dict[str, Any]) -> str:
-    """Identity alert: clean, scannable, market cap visible."""
     s = score_project(p)
     chain = (p.get("chain") or "?").upper()
     kind = classify_project(p)
     src_badge = source_label(p, for_alert=True)
+    launch_ts = p.get("launched_at") or p.get("discovered_at")
     identity = []
     if p.get("twitter"):
         identity.append("X")
@@ -2030,15 +2004,14 @@ def alert_text(p: dict[str, Any]) -> str:
     head = f"🚨 <b>NEW PROJECT IDENTIFIED ({esc(chain)})</b>"
     if src_badge:
         head += f" · {src_badge}"
-    mcap = p.get("market_cap")
-    fdv = p.get("fdv")
     lines = [
         head,
         f"<b>{esc(title_of(p))}</b> · {kind['label']}",
         f"Identity: <b>{esc(id_line)}</b>",
         f"Contract: <code>{esc(p.get('token_address') or '—')}</code>",
+        f"Deployed: {esc(ago(launch_ts))}",
         "",
-        f"💰 MCAP: <b>{esc(money(mcap))}</b> · FDV: {esc(money(fdv))}",
+        f"💰 MCAP: <b>{esc(money(p.get('market_cap')))}</b> · FDV: {esc(money(p.get('fdv')))}",
         f"💧 Liq: {esc(money(p.get('liquidity_usd')))} · 📊 Vol 24h: {esc(money(p.get('volume_24h')))}",
         "",
     ]
@@ -2050,14 +2023,13 @@ def alert_text(p: dict[str, Any]) -> str:
         lines.append(f"🌐 Web: {esc(p.get('website'))}")
     lines += [
         "",
-        f"First seen: {esc(ago(p.get('discovered_at')))}",
+        f"First seen by Scout: {esc(ago(p.get('discovered_at')))}",
         f"🎯 {s['band']} {s['score']}/100",
     ]
     return "\n".join(lines)
 
 
 def source_label(p: dict[str, Any], *, for_alert: bool = False) -> str:
-    """Badge for listing source. Alerts hide DexScreener noise; keep CMC/CG."""
     s = (p.get("source") or "").lower()
     if s in {"cmc", "coinmarketcap"}:
         return "📈 CMC"
@@ -2072,11 +2044,6 @@ def source_label(p: dict[str, Any], *, for_alert: bool = False) -> str:
     if s:
         return s
     return ""
-
-
-def has_project_identity(p: dict[str, Any]) -> bool:
-    """Alert gate: real project identity, not bare contract."""
-    return bool(p.get("website") or p.get("twitter") or p.get("telegram") or p.get("discord"))
 
 
 # ---------- app helpers ----------
@@ -2183,7 +2150,6 @@ async def enrich_one(db: DB, client: httpx.AsyncClient, project: dict[str, Any],
 
 
 async def resolve_id_or_ca(db: DB, client: httpx.AsyncClient, query: str, bot=None) -> dict[str, Any] | None:
-    """Accept project id OR contract address (with optional chain: prefix)."""
     q = (query or "").strip()
     if not q:
         return None
@@ -2238,6 +2204,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "I only alert when a project identity appears "
         "(X / Telegram / website).\n\n"
         "/newtokens 12h — catch up\n"
+        "/menu — command menu\n"
         "/watch &lt;CA&gt; — notify when socials appear\n"
         "/help — all commands"
     )
@@ -2247,6 +2214,43 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.effective_message:
         return
     await update.effective_message.reply_html(HELP)
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline menu that inserts command text into the input field (does not auto-send)."""
+    if not await gate(update, context) or not update.effective_message:
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton("🔎 /newtokens", switch_inline_query_current_chat="/newtokens "),
+            InlineKeyboardButton("💼 /jobs", switch_inline_query_current_chat="/jobs "),
+        ],
+        [
+            InlineKeyboardButton("🧠 /project", switch_inline_query_current_chat="/project "),
+            InlineKeyboardButton("🎭 /persona", switch_inline_query_current_chat="/persona "),
+        ],
+        [
+            InlineKeyboardButton("🎯 /approach", switch_inline_query_current_chat="/approach "),
+            InlineKeyboardButton("🔍 /gaps", switch_inline_query_current_chat="/gaps "),
+        ],
+        [
+            InlineKeyboardButton("⚠️ /risks", switch_inline_query_current_chat="/risks "),
+            InlineKeyboardButton("⭐ /watch", switch_inline_query_current_chat="/watch "),
+        ],
+        [
+            InlineKeyboardButton("📋 /watchlist", switch_inline_query_current_chat="/watchlist"),
+            InlineKeyboardButton("📡 /status", switch_inline_query_current_chat="/status"),
+        ],
+        [
+            InlineKeyboardButton("🦎 /cg", switch_inline_query_current_chat="/cg"),
+            InlineKeyboardButton("📈 /cmc", switch_inline_query_current_chat="/cmc"),
+        ],
+    ]
+    await update.effective_message.reply_html(
+        "📋 <b>Command Menu</b>\n"
+        "Tap a button — it inserts the command into your text field so you can add parameters before sending.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def render_page(update: Update, context: ContextTypes.DEFAULT_TYPE, since_ts: int, offset: int, label: str, edit: bool) -> None:
@@ -2357,7 +2361,7 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.effective_message.reply_text(
             "Usage:\n/watch <project_id>\n/watch <CA>\n/watch chain:CA\n\n"
-            "Scout will keep monitoring and alert when socials, liquidity, or activity appear — even while you are offline."
+            "Scout monitors and alerts when socials, liquidity, or activity appear."
         )
         return
     db, client = deps(context)
@@ -2492,6 +2496,7 @@ async def ranked_window(db: DB, since_ts: int, min_score: int = 45) -> list[dict
 
 
 async def cmd_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show persona selector for a project."""
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
@@ -2502,59 +2507,104 @@ async def cmd_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not project:
         await update.effective_message.reply_text("Could not resolve id/CA. Try /project <CA> first.")
         return
-    project = await enrich_one(db, client, project, context.bot)
-    text = await approach_text(project)
     await update.effective_message.reply_html(
-        text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
+        f"🎯 <b>Choose Approach / Persona</b>\n"
+        f"<b>{esc(title_of(project))}</b>\n\n"
+        "Pick the voice you want the generated messages written in:",
+        reply_markup=persona_select_keyboard(int(project["id"])),
+    )
+
+
+async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate with default curious persona or show selector."""
+    if not await gate(update, context) or not update.effective_message:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /persona <project_id|CA>")
+        return
+    db, client = deps(context)
+    project = await resolve_id_or_ca(db, client, " ".join(context.args), context.bot)
+    if not project:
+        await update.effective_message.reply_text("Could not resolve id/CA.")
+        return
+    project = await enrich_one(db, client, project, context.bot)
+    text = await persona_text(project, "curious")
+    await update.effective_message.reply_html(
+        text, disable_web_page_preview=True,
+        reply_markup=persona_select_keyboard(int(project["id"])),
     )
 
 
 async def cb_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show persona selector."""
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Building brief…")
+    await safe_cb_answer(q)
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
-        await safe_cb_answer(q, "Bad button", show_alert=True)
+        return
+    db, _ = deps(context)
+    project = await db.by_id(pid)
+    if not project:
+        await safe_cb_answer(q, "Expired. Open /jobs again.", show_alert=True)
+        return
+    await safe_edit(
+        q,
+        f"🎯 <b>Choose Approach / Persona</b>\n<b>{esc(title_of(project))}</b>\n\n"
+        "Pick the voice for the generated messages:",
+        persona_select_keyboard(pid),
+    )
+
+
+async def cb_persona_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate text in the selected persona."""
+    if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
+        return
+    q = update.callback_query
+    await safe_cb_answer(q, "Writing…")
+    try:
+        parts = q.data.split(":")
+        pid = int(parts[1])
+        persona_key = parts[2] if len(parts) > 2 else "curious"
+    except Exception:
         return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "That button is from before a restart. Send /jobs and open it again.", show_alert=True)
+        await safe_cb_answer(q, "Expired. Open /jobs again.", show_alert=True)
         return
     try:
         project = await enrich_one(db, client, project, context.bot)
-        text = await approach_text(project)
-        await safe_edit(q, text, report_keyboard(project))
+        text = await persona_text(project, persona_key)
+        await safe_edit(q, text, persona_select_keyboard(pid))
     except Exception as exc:
-        log.exception("cb_approach failed")
+        log.exception("cb_persona_select failed")
         await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
 
 
-async def cb_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Same as approach but forces a fresh AI / fallback set and edits in place."""
+async def cb_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Legacy / quick persona (curious default)."""
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Shuffling…")
+    await safe_cb_answer(q, "Building…")
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
-        await safe_cb_answer(q, "Bad button", show_alert=True)
         return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "That button is from before a restart. Send /jobs and open it again.", show_alert=True)
+        await safe_cb_answer(q, "Expired.", show_alert=True)
         return
     try:
         project = await enrich_one(db, client, project, context.bot)
-        text = await approach_text(project)
-        await safe_edit(q, text, report_keyboard(project))
+        text = await persona_text(project, "curious")
+        await safe_edit(q, text, persona_select_keyboard(pid))
     except Exception as exc:
-        log.exception("cb_shuffle failed")
+        log.exception("cb_persona failed")
         await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
 
 
@@ -2562,7 +2612,7 @@ async def cb_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Analyzing gaps…")
+    await safe_cb_answer(q, "Researching gaps…")
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
@@ -2570,7 +2620,7 @@ async def cb_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "Expired button. Open /jobs again.", show_alert=True)
+        await safe_cb_answer(q, "Expired.", show_alert=True)
         return
     try:
         project = await enrich_one(db, client, project, context.bot)
@@ -2585,7 +2635,7 @@ async def cb_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Risks…")
+    await safe_cb_answer(q, "Researching risks…")
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
@@ -2593,7 +2643,7 @@ async def cb_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "Expired — /jobs again", show_alert=True)
+        await safe_cb_answer(q, "Expired.", show_alert=True)
         return
     try:
         project = await enrich_one(db, client, project, context.bot)
@@ -2616,7 +2666,7 @@ async def cb_onchain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "That button is from before a restart. Send /jobs and open it again.", show_alert=True)
+        await safe_cb_answer(q, "Expired.", show_alert=True)
         return
     try:
         project = await enrich_one(db, client, project, context.bot)
@@ -2639,7 +2689,7 @@ async def cmd_early(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ][:10]
     lines = ["🌱 <b>EARLY / SOCIAL-FIRST</b>"]
     if x_items:
-        lines.append("From X (last 7 days search):")
+        lines.append("From X:")
         for i, item in enumerate(x_items[:8], 1):
             user = item.get("username") or "?"
             lines.append(
@@ -2648,16 +2698,9 @@ async def cmd_early(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"https://x.com/{user}/status/{item.get('tweet_id')}"
             )
     else:
-        xstate = KEY_STATUS.get("x") or "missing"
-        if xstate == "missing":
-            lines.append("X search off — variable <code>X_BEARER_TOKEN</code> is not visible to this service.")
-        else:
-            lines.append(
-                f"X search failed ({esc(xstate)}). Bearer is present but X rejected it "
-                "(wrong token, URL-encoded, or the app has no recent-search access)."
-            )
+        lines.append("X search off or failed (set X_BEARER_TOKEN).")
     if social_first:
-        lines += ["", "Token already live but still thin — socials showed up early:"]
+        lines += ["", "Token live but still thin — socials showed up early:"]
         for i, p in enumerate(social_first[:6], 1):
             lines.append(list_item(i, p))
     markup = list_keyboard(social_first, now() - 48 * 3600, 0, len(social_first)) if social_first else None
@@ -2708,7 +2751,6 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ---------- background loops ----------
 
 async def monitor_watches(app: Application) -> None:
-    """Compare watched project snapshots and alert on meaningful changes."""
     db: DB = app.bot_data["db"]
     client: httpx.AsyncClient = app.bot_data["http"]
     rows = await db.all_watches()
@@ -2735,7 +2777,7 @@ async def monitor_watches(app: Application) -> None:
             continue
         chain = (fresh.get("chain") or "?").upper()
         text = (
-            f"⭐ <b>WATCH ALERT ({esc(chain)})</b> · {source_label(fresh)}\n"
+            f"⭐ <b>WATCH ALERT ({esc(chain)})</b>\n"
             f"#{pid} {esc(title_of(fresh))}\n"
             + "\n".join(esc(d) for d in diffs)
         )
@@ -2758,7 +2800,6 @@ async def discovery_once(app: Application) -> None:
     db: DB = app.bot_data["db"]
     client: httpx.AsyncClient = app.bot_data["http"]
 
-    # DexScreener profiles (latest + recent updates)
     for path in ("token-profiles/latest/v1", "token-profiles/recent-updates/v1"):
         profiles = await http_get(client, f"{DEX_API}/{path}")
         if isinstance(profiles, list):
@@ -2767,7 +2808,6 @@ async def discovery_once(app: Application) -> None:
                 if parsed.get("chain") in DEFAULT_CHAINS and parsed.get("token_address"):
                     await db.upsert(parsed)
 
-    # Boosted tokens
     boosted = await http_get(client, f"{DEX_API}/token-boosts/latest/v1")
     if isinstance(boosted, list):
         for raw in boosted:
@@ -2781,29 +2821,14 @@ async def discovery_once(app: Application) -> None:
                     "qualified": False,
                 })
 
-    # GeckoTerminal — FIXED: only a small rotating subset each cycle to avoid 429 storm
     all_gecko = [
-        ("solana", "solana"),
-        ("eth", "ethereum"),
-        ("base", "base"),
-        ("bsc", "bsc"),
-        ("arbitrum", "arbitrum"),
-        ("polygon_pos", "polygon"),
-        ("sui-network", "sui"),
-        ("ton", "ton"),
-        ("ink", "ink"),
-        ("abstract", "abstract"),
-        ("hyperevm", "hyperevm"),
-        ("cronos", "cronos"),
-        ("optimism", "optimism"),
-        ("avax", "avalanche"),
-        ("blast", "blast"),
-        ("linea", "linea"),
-        ("scroll", "scroll"),
-        ("sonic", "sonic"),
+        ("solana", "solana"), ("eth", "ethereum"), ("base", "base"), ("bsc", "bsc"),
+        ("arbitrum", "arbitrum"), ("polygon_pos", "polygon"), ("sui-network", "sui"),
+        ("ton", "ton"), ("ink", "ink"), ("abstract", "abstract"), ("hyperevm", "hyperevm"),
+        ("cronos", "cronos"), ("optimism", "optimism"), ("avax", "avalanche"),
+        ("blast", "blast"), ("linea", "linea"), ("scroll", "scroll"), ("sonic", "sonic"),
         ("monad", "monad"),
     ]
-    # Rotate: take 4 networks per cycle based on current minute
     start = (now() // 60) % max(1, len(all_gecko) - 3)
     gecko_batch = all_gecko[start:start + 4]
     for network_id, _chain in gecko_batch:
@@ -2817,9 +2842,8 @@ async def discovery_once(app: Application) -> None:
             for parsed in parse_gecko(gecko):
                 if parsed.get("chain") in DEFAULT_CHAINS:
                     await db.upsert(parsed)
-        await asyncio.sleep(1.2)  # respectful to free tier
+        await asyncio.sleep(1.2)
 
-    # Enrich a batch
     rows = await db.unenriched(16)
     by_chain: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -2932,7 +2956,7 @@ async def discovery_loop(app: Application) -> None:
             last_cmd = int(app.bot_data.get("last_command_at") or 0)
             busy = last_cmd and (now() - last_cmd) < 30
             last_scan = int(app.bot_data.get("last_scan_at") or 0)
-            interval = int(os.getenv("DISCOVERY_INTERVAL_SEC", "90"))  # safer default
+            interval = int(os.getenv("DISCOVERY_INTERVAL_SEC", "90"))
             due = (now() - last_scan) >= interval
             idle_kick = last_cmd and (now() - last_cmd) >= 30 and (now() - last_scan) >= 30
             if (due or idle_kick or not last_scan) and not busy:
@@ -2955,14 +2979,16 @@ async def on_start(app: Application) -> None:
             [
                 BotCommand("start", "Start Scout"),
                 BotCommand("help", "Command list"),
+                BotCommand("menu", "Insertable command menu"),
                 BotCommand("newtokens", "New projects catch-up"),
                 BotCommand("project", "Full report by CA or id"),
                 BotCommand("jobs", "Opportunity shortlist"),
                 BotCommand("digest", "Top picks window"),
-                BotCommand("approach", "Persona openers"),
+                BotCommand("approach", "Choose persona / voice"),
+                BotCommand("persona", "Generate persona messages"),
                 BotCommand("ask", "Ask AI about a project"),
-                BotCommand("gaps", "Gaps (meme or utility aware)"),
-                BotCommand("risks", "On-chain + web + X risks"),
+                BotCommand("gaps", "Researched gaps analysis"),
+                BotCommand("risks", "Researched risk brief"),
                 BotCommand("watch", "Watch CA until socials"),
                 BotCommand("unwatch", "Remove from watchlist"),
                 BotCommand("watchlist", "Your watches"),
@@ -3037,42 +3063,49 @@ async def cmd_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def gaps_text(p: dict[str, Any]) -> str:
-    """Meme-aware vs utility-aware gap analysis."""
+    """Researched gaps. Verify presence before claiming missing. Meme vs utility aware."""
     kind = classify_project(p)
-    is_meme = kind.get("type") == "meme" or "🐸" in str(kind.get("label") or "") or "meme" in str(kind.get("label") or "").lower()
+    is_meme = kind.get("type") == "meme"
     ctx = _project_ctx(p)
+    has_web = bool(p.get("website"))
+    has_x = bool(p.get("twitter"))
+    has_tg = bool(p.get("telegram"))
+    has_docs = bool(p.get("docs"))
 
     if is_meme:
         prompt = (
             f"{ctx}\n\n"
-            "This is a MEME / culture coin. Do NOT demand whitepaper, roadmap, audit, or enterprise docs.\n"
+            "This is a MEME / culture coin. Do NOT demand whitepaper or enterprise docs.\n"
+            "CRITICAL: Only claim something is missing if the data above truly lacks it. "
+            f"Website present: {has_web}. X present: {has_x}. TG present: {has_tg}. Docs present: {has_docs}.\n"
             "Focus on meme-native gaps: unclear CA posts, scattered lore, dead TG energy, "
             "no LP transparency, mixed signals, weak mascot story, confusing buy path.\n"
-            "Return labels:\nMEME_VIBE\nWHAT_WORKS\nMEME_PROBLEMS\nCOMMUNITY_GAPS\n"
-            "TRUST_SHORTCUTS\nCONTENT_ANGLES\nINVESTOR_TURN_OFFS\nFIXES\n"
-            "Tone: sharp, meme-literate, practical. No generic 'add a roadmap' advice."
+            "Return clean sections:\nMEME_VIBE\nWHAT_WORKS\nMEME_PROBLEMS\nCOMMUNITY_GAPS\n"
+            "TRUST_SHORTCUTS\nCONTENT_ANGLES\nFIXES\n"
+            "Tone: sharp, meme-literate, practical. Human critique who actually looked."
         )
     else:
         prompt = (
             f"{ctx}\n\n"
-            "This looks UTILITY / product-led. Dig into product UX clarity, trust, and investor-grade questions.\n"
-            "Do NOT ask questions already answered on the website text provided.\n"
-            "Prefer: differentiation vs competitors, retention loop, who pays, why token, "
-            "admin keys, launch readiness, proof of usage.\n"
+            "This looks UTILITY / product-led.\n"
+            "CRITICAL: Only claim something is missing if the data above truly lacks it. "
+            f"Website present: {has_web}. X present: {has_x}. TG present: {has_tg}. Docs present: {has_docs}.\n"
+            "Dig into product UX clarity, trust, investor-grade questions.\n"
+            "Prefer: differentiation, retention loop, who pays, why token, admin keys, proof of usage.\n"
             "Labels:\nPRODUCT_UX\nWHAT_SITE_ALREADY_SAYS\nREAL_GAPS\nINVESTOR_QUESTIONS\n"
-            "COMPETITOR_EDGE\nTRUST_GAPS\nCONTENT_OPPORTUNITIES\nFIXES\n"
-            "No filler. Evidence-based only."
+            "TRUST_GAPS\nCONTENT_OPPORTUNITIES\nFIXES\n"
+            "Evidence-based only. Sound like someone who tested the product."
         )
-    out = await _scout_llm(prompt)
+    out = await llm_write(prompt)
     header = [
         "🔍 <b>GAPS &amp; FIT</b>",
         f"<b>{esc(title_of(p))}</b> · {kind['label']}",
         f"💰 MCAP: <b>{esc(money(p.get('market_cap')))}</b>",
+        f"Verified links: Web {mark(has_web)} · X {mark(has_x)} · TG {mark(has_tg)} · Docs {mark(has_docs)}",
         "",
     ]
     if not out:
-        body = _gaps_fallback(p, is_meme)
-        return "\n".join(header + body)
+        return "\n".join(header + _gaps_fallback(p, is_meme))
     text = out.replace("**", "")
     pretty = []
     for ln in text.splitlines()[:90]:
@@ -3081,7 +3114,7 @@ async def gaps_text(p: dict[str, Any]) -> str:
             pretty.append("")
             continue
         if ln.isupper() and len(ln) < 40:
-            pretty.append(f"\n<b>{esc(ln.title())}</b>")
+            pretty.append(f"\n<b>{esc(ln.replace('_', ' ').title())}</b>")
         elif ln.startswith("•") or ln.startswith("-"):
             pretty.append("• " + esc(ln.lstrip("•- ").strip()))
         else:
@@ -3094,9 +3127,11 @@ def _project_ctx(p: dict[str, Any]) -> str:
     return (
         f"Name: {title_of(p)}\nChain: {p.get('chain')}\nCA: {p.get('token_address')}\n"
         f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTG: {p.get('telegram')}\n"
+        f"Docs: {p.get('docs')}\n"
         f"Desc: {p.get('description')}\nSite about: {comm.get('site_about')}\n"
         f"TG about: {comm.get('tg_about')}\nLiq: {p.get('liquidity_usd')} MCAP: {p.get('market_cap')}\n"
-        f"Holders: {comm.get('holders')} Deployer: {comm.get('deployer')}"
+        f"Holders: {comm.get('holders')} Deployer: {comm.get('deployer')}\n"
+        f"Honeypot: {comm.get('honeypot')} BuyTax: {comm.get('buy_tax')} SellTax: {comm.get('sell_tax')}"
     )
 
 
@@ -3126,110 +3161,97 @@ def _gaps_fallback(p: dict[str, Any], is_meme: bool) -> list[str]:
     ]
 
 
-async def _scout_llm(prompt: str) -> str:
-    import httpx as _hx
-    groq = (os.getenv("GROQ_API_KEY") or "").strip().strip('"')
-    ork = (os.getenv("OPENROUTER_API_KEY") or "").strip().strip('"')
-    system = "Web3 project analyst. Concise. No investment advice. No invented metrics."
-    async with _hx.AsyncClient(timeout=60) as client:
-        for name, key, url, model in [
-            ("groq", groq, "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile"),
-            ("groq", groq, "https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-20b"),
-            ("openrouter", ork, "https://openrouter.ai/api/v1/chat/completions", "openai/gpt-4o-mini"),
-        ]:
-            if not key:
-                continue
-            try:
-                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-                if name == "openrouter":
-                    headers["HTTP-Referer"] = "https://railway.app"
-                r = await client.post(
-                    url,
-                    headers=headers,
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt[:12000]},
-                        ],
-                    },
-                )
-                if r.status_code >= 400:
-                    continue
-                data = r.json()
-                text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
-                if text:
-                    return text
-            except Exception:
-                continue
-    return ""
-
-
 async def risks_text(p: dict[str, Any]) -> str:
-    """Unified risks: on-chain + web + X, with how to fix investor turn-offs."""
+    """Clean risk brief cards. Research-first. No markdown tables."""
     kind = classify_project(p)
-    is_meme = "meme" in str(kind.get("label") or "").lower() or kind.get("type") == "meme"
+    is_meme = kind.get("type") == "meme"
     ctx = _project_ctx(p)
-    prompt = (
-        f"{ctx}\n\nType hint: {'MEME' if is_meme else 'UTILITY'}\n"
-        "Produce risk intelligence with labels:\n"
-        "ONCHAIN_RISKS\nWEBSITE_RISKS\nX_SOCIAL_RISKS\nINVESTOR_TURN_OFFS\nHOW_TO_FIX\n"
-        "Be specific to available evidence. Never invent holder %, tax, or LP lock facts.\n"
-        "For memes: skip whitepaper lectures; focus on transparency, LP, narrative consistency.\n"
-        "For utility: focus on product trust, admin power, unclear token capture."
-    )
-    out = await _scout_llm(prompt)
+    has_web = bool(p.get("website"))
+    has_x = bool(p.get("twitter"))
+    has_tg = bool(p.get("telegram"))
+    has_docs = bool(p.get("docs"))
     comm = community(p)
+
+    prompt = (
+        f"{ctx}\n\nType: {'MEME' if is_meme else 'UTILITY'}\n"
+        f"Verified: Website={has_web}, X={has_x}, TG={has_tg}, Docs={has_docs}\n\n"
+        "RESEARCH PROTOCOL: Do NOT claim missing socials/docs if data shows they exist. "
+        "Only state risks supported by the observed data (on-chain numbers, site text, social presence).\n"
+        "Produce a clean risk brief with these exact section headers:\n"
+        "ONCHAIN_RISKS\nWEBSITE_RISKS\nSOCIALS_RISKS\nINVESTOR_RED_FLAGS\nHOW_TO_FIX\n"
+        "Under each risk put a short '👉 Fix: ...' line.\n"
+        "For memes: focus on transparency, LP, narrative consistency — skip whitepaper lectures.\n"
+        "For utility: focus on product trust, admin power, unclear token capture.\n"
+        "Be specific. No invented holder %, tax, or LP lock facts."
+    )
+    out = await llm_write(prompt)
+
     lines = [
-        "⚠️ <b>RISK BRIEF</b>",
-        f"<b>{esc(title_of(p))}</b> · {kind['label']}",
-        f"💰 MCAP: <b>{esc(money(p.get('market_cap')))}</b> · 💧 {esc(money(p.get('liquidity_usd')))}",
+        f"⚠️ <b>RISK BRIEF: {esc(title_of(p))}</b>",
+        f"🏷 Sector / Type: {kind['label']}",
+        f"💰 MCAP: {esc(money(p.get('market_cap')))} · 💧 Liquidity: {esc(money(p.get('liquidity_usd')))}",
+        f"Verified: Web {mark(has_web)} · X {mark(has_x)} · TG {mark(has_tg)} · Docs {mark(has_docs)}",
         "",
         "⛓ <b>ON-CHAIN (observed)</b>",
         f"Deployer: <code>{esc(comm.get('deployer') or '—')}</code>",
         f"Holders: {esc(comm.get('holders') if comm.get('holders') is not None else '—')}",
         f"Rugcheck: {esc(comm.get('rugcheck_score') if comm.get('rugcheck_score') is not None else '—')}",
     ]
+    if comm.get("honeypot") is not None:
+        lines.append(f"Honeypot: {'YES ⚠️' if comm.get('honeypot') else 'No'}")
     if float(p.get("liquidity_usd") or 0) < 5000:
         lines.append("• Thin liquidity — market-cap moves can be fragile.")
+
+    lines.append("")
+    lines.append("🚨 <b>IDENTIFIED RISKS &amp; FIXES</b>")
+
     if not out:
         lines += [
             "",
-            "⚠️ AI risk narrative unavailable — showing automated signals only.",
+            "• On-Chain Risks:",
+            "  - Limited free data — verify LP lock & mint authority on explorer.",
+            "  👉 Fix: Publish verified LP + admin status in one official place.",
             "",
-            "🎯 <b>HOW TO IMPROVE TRUST</b>",
-            "• Publish CA + LP status in one official place.",
-            "• Keep X/TG links consistent.",
-            "• Avoid overclaiming; show proof links.",
+            "• Website & Security Risks:",
+            f"  - {'No website indexed' if not has_web else 'Website present — check trust messaging'}.",
+            "  👉 Fix: Keep CA + official links consistent everywhere.",
+            "",
+            "• Socials & Community Risks:",
+            f"  - X: {'missing' if not has_x else 'present'} · TG: {'missing' if not has_tg else 'present'}.",
+            "  👉 Fix: Single source of truth for links + CA.",
+            "",
+            "• Major Investor Red Flags:",
+            "  - Incomplete free data on taxes / LP / admin powers.",
+            "  👉 Fix: Transparent one-pager covering the above.",
         ]
         return "\n".join(lines)
+
     text = out.replace("**", "")
-    lines.append("")
-    for ln in text.splitlines()[:70]:
+    for ln in text.splitlines()[:80]:
         ln = ln.strip()
         if not ln:
             lines.append("")
             continue
         if ln.isupper() and len(ln) < 36:
-            lines.append(f"\n<b>{esc(ln.replace('_', ' ').title())}</b>")
+            title = ln.replace("_", " ").title()
+            lines.append(f"\n<b>• {esc(title)}</b>")
+        elif ln.startswith("👉") or "fix:" in ln.lower():
+            lines.append("  " + esc(ln))
         elif ln.startswith("•") or ln.startswith("-"):
-            lines.append("• " + esc(ln.lstrip("•- ").strip()))
+            lines.append("  - " + esc(ln.lstrip("•- ").strip()))
         else:
             lines.append(esc(ln))
     return "\n".join(lines)
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ask the AI for persona replies.
-    Usage: /ask <id|CA> <question>
-    """
     if not await gate(update, context) or not update.effective_message:
         return
     args = context.args or []
     if len(args) < 2:
         await update.effective_message.reply_text(
             "Usage:\n/ask <project_id|CA> <question>\n\n"
-            "Example:\n/ask 42 how does staking work?\n/ask 0xabc... is the product live?"
+            "Example:\n/ask 42 how does staking work?"
         )
         return
     db, client = deps(context)
@@ -3248,7 +3270,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     project = await resolve_id_or_ca(db, client, query, context.bot)
     if not project:
-        await update.effective_message.reply_text("Could not resolve id/CA. Use /project first.")
+        await update.effective_message.reply_text("Could not resolve id/CA.")
         return
     project = await enrich_one(db, client, project, context.bot)
     text = await ask_personas_text(project, question)
@@ -3266,17 +3288,16 @@ async def ask_personas_text(p: dict[str, Any], question: str) -> str:
         f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
         f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTelegram: {p.get('telegram')}\n"
         f"About: {what}\n"
-        f"Community question (from chat or user):\n{question}\n\n"
-        f"Write reply options a community operator could post. "
-        f"Use these labels exactly, each 1-2 sentences, human, specific to THIS product:\n"
-        f"CURIOUS\nINVESTOR\nSUGGESTION\nQUESTION\nSUPPORTER\nSTRATEGIST\nRANDOM\n"
-        f"No hashtags dump. No investment advice. Variation seed {random.randint(1,9999)}."
+        f"Community question:\n{question}\n\n"
+        f"Write 4-5 ready-to-post reply options in different human voices "
+        f"(curious, investor, holder, strategist). "
+        f"Sound real. No AI meta. Variation seed {random.randint(1,9999)}.\n"
+        f"Format:\nOPTION 1\n<text>\nOPTION 2\n<text>..."
     )
     generated = await llm_write(prompt)
     header = [
         "🗣 <b>PERSONA REPLIES</b>",
         f"<b>{esc(title_of(p))}</b> · {kind['label']} · {s['band']} {s['score']}/100",
-        f"⛓ {esc((p.get('chain') or '?').title())}",
         "",
         "❓ <b>Question</b>",
         f"<i>{esc(question)[:500]}</i>",
@@ -3286,30 +3307,22 @@ async def ask_personas_text(p: dict[str, Any], question: str) -> str:
         body = [copyable_brief(generated)]
     else:
         body = [
-            f"⚠️ AI offline · {esc(KEY_STATUS.get('groq') or KEY_STATUS.get('openrouter') or KEY_STATUS.get('gemini') or 'no key')}",
+            f"⚠️ AI offline",
             "",
-            "<b>CURIOUS</b>",
-            f"<code>Good question. From what I read about {esc(title_of(p))}, the public copy is still thin — does the team have a short FAQ for this?</code>",
-            "<b>SUGGESTION</b>",
-            "<code>Pin a 3-line answer in the chat so the same question stops looping.</code>",
-            "<b>QUESTION</b>",
-            "<code>Is this answered in docs, or only in voice chats / AMAs?</code>",
+            "<b>OPTION 1</b>",
+            f"<code>Good question. From what I read about {esc(title_of(p))}, the public copy is still thin on this — does the team have a short FAQ?</code>",
+            "<b>OPTION 2</b>",
+            "<code>Pin a 3-line answer so the same question stops looping.</code>",
         ]
     return "\n".join(header + body + ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}"])
 
 
 async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """CoinGecko trending with socials — saved as Scout projects + clickable buttons."""
     if not await gate(update, context) or not update.effective_message:
         return
     db, client = deps(context)
-    await update.effective_message.reply_text("🦎 Scanning CoinGecko trending (socials only)…")
-    lines = [
-        "🦎 <b>COINGECKO · LATEST + SOCIALS</b>",
-        "Source: CoinGecko · only items with website / X / Telegram",
-        "Tap a project to Investigate / Approach / Gaps / Watch",
-        "",
-    ]
+    await update.effective_message.reply_text("🦎 Scanning CoinGecko trending…")
+    lines = ["🦎 <b>COINGECKO · LATEST + SOCIALS</b>", ""]
     saved: list[dict[str, Any]] = []
     try:
         resp = await client.get(
@@ -3317,9 +3330,6 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             timeout=20,
             headers={"Accept": "application/json"},
         )
-        if resp.status_code == 429:
-            await update.effective_message.reply_text("CoinGecko rate limit. Try again shortly.")
-            return
         if resp.status_code >= 400:
             await update.effective_message.reply_text(f"CoinGecko HTTP {resp.status_code}")
             return
@@ -3333,13 +3343,7 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             detail = await http_get(
                 client,
                 f"https://api.coingecko.com/api/v3/coins/{cid}",
-                params={
-                    "localization": "false",
-                    "tickers": "false",
-                    "market_data": "false",
-                    "community_data": "true",
-                    "developer_data": "false",
-                },
+                params={"localization": "false", "tickers": "false", "market_data": "false", "community_data": "true", "developer_data": "false"},
             )
             if not isinstance(detail, dict):
                 continue
@@ -3381,52 +3385,33 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if row:
                 saved.append(row)
                 lines.append(
-                    f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())} · 🦎 CG\n"
+                    f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())}\n"
                     f"🌐 {mark(row.get('website'))}  𝕏 {mark(row.get('twitter'))}  💬 {mark(row.get('telegram'))}"
                 )
             if len(saved) >= 10:
                 break
         if not saved:
-            lines.append("No trending coins with both socials and a contract address right now.")
+            lines.append("No trending coins with socials + contract right now.")
     except Exception as exc:
         await update.effective_message.reply_text(f"CoinGecko failed: {exc}")
         return
     markup = list_keyboard(saved, now() - 86400, 0, len(saved)) if saved else None
-    await update.effective_message.reply_html(
-        "\n".join(lines), disable_web_page_preview=True, reply_markup=markup
-    )
+    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True, reply_markup=markup)
 
 
 async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """CMC newest with socials — upsert contracts + clickable Investigate buttons."""
     if not await gate(update, context) or not update.effective_message:
         return
     db, client = deps(context)
-    await update.effective_message.reply_text("📈 Scanning CMC new listings (socials + contract)…")
-    lines = [
-        "📈 <b>CMC · NEWLY LISTED + SOCIALS</b>",
-        "Source: CoinMarketCap · last ~7 days · website / X / Telegram required",
-        "Tap a project to Investigate / Approach / Gaps / Watch",
-        "",
-    ]
+    await update.effective_message.reply_text("📈 Scanning CMC new listings…")
+    lines = ["📈 <b>CMC · NEWLY LISTED + SOCIALS</b>", ""]
     saved: list[dict[str, Any]] = []
     try:
         resp = await client.get(
             "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/listing",
-            params={
-                "start": 1,
-                "limit": 25,
-                "sortBy": "date_added",
-                "sortType": "asc",
-                "convert": "USD",
-                "cryptoType": "all",
-                "tagType": "all",
-            },
+            params={"start": 1, "limit": 25, "sortBy": "date_added", "sortType": "asc", "convert": "USD", "cryptoType": "all", "tagType": "all"},
             timeout=25,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (compatible; Web3ProjectScout/1.0)",
-            },
+            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0 (compatible; Web3ProjectScout/1.0)"},
         )
         if resp.status_code >= 400:
             await update.effective_message.reply_text(f"CMC HTTP {resp.status_code}")
@@ -3458,10 +3443,7 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     client,
                     "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail",
                     params={"id": cid},
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": "Mozilla/5.0 (compatible; Web3ProjectScout/1.0)",
-                    },
+                    headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0 (compatible; Web3ProjectScout/1.0)"},
                 )
                 if isinstance(detail, dict):
                     d = detail.get("data") if isinstance(detail.get("data"), dict) else detail
@@ -3476,10 +3458,6 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                             telegram = u
                         elif "discord" in u.lower():
                             discord = u
-                    platforms = (d or {}).get("platforms") or []
-                    if platforms and not addr:
-                        addr = platforms[0].get("contractAddress") or addr
-                        chain = CMC_CHAIN_MAP.get((platforms[0].get("contractPlatform") or "").lower(), chain)
             if not (website or twitter or telegram or discord):
                 continue
             added_raw = c.get("dateAdded") or ""
@@ -3518,7 +3496,7 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             saved.append(row)
             lines.append(
-                f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())} · 📈 CMC\n"
+                f"#{row['id']} <b>{esc(title_of(row))}</b> · {esc((row.get('chain') or '').title())}\n"
                 f"listed {esc(added)} · {esc(money(price) if price is not None else '—')}\n"
                 f"🌐 {mark(row.get('website'))}  𝕏 {mark(row.get('twitter'))}  💬 {mark(row.get('telegram'))}"
             )
@@ -3530,9 +3508,7 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(f"CMC failed: {exc}")
         return
     markup = list_keyboard(saved, now() - 86400, 0, len(saved)) if saved else None
-    await update.effective_message.reply_html(
-        "\n".join(lines), disable_web_page_preview=True, reply_markup=markup
-    )
+    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True, reply_markup=markup)
 
 
 def main() -> None:
@@ -3554,6 +3530,7 @@ def main() -> None:
     app.add_handler(TypeHandler(Update, note_activity), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("newtokens", cmd_newtokens))
     app.add_handler(CommandHandler("project", cmd_project))
     app.add_handler(CommandHandler("research", cmd_project))
@@ -3564,6 +3541,7 @@ def main() -> None:
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("approach", cmd_approach))
+    app.add_handler(CommandHandler("persona", cmd_persona))
     app.add_handler(CommandHandler("early", cmd_early))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("gaps", cmd_gaps))
@@ -3574,7 +3552,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_newtokens, pattern=r"^nt:"))
     app.add_handler(CallbackQueryHandler(cb_investigate, pattern=r"^inv:"))
     app.add_handler(CallbackQueryHandler(cb_approach, pattern=r"^ap:"))
-    app.add_handler(CallbackQueryHandler(cb_shuffle, pattern=r"^sh:"))
+    app.add_handler(CallbackQueryHandler(cb_persona, pattern=r"^ps:"))
+    app.add_handler(CallbackQueryHandler(cb_persona_select, pattern=r"^pn:"))
     app.add_handler(CallbackQueryHandler(cb_onchain, pattern=r"^oc:"))
     app.add_handler(CallbackQueryHandler(cb_gaps, pattern=r"^gp:"))
     app.add_handler(CallbackQueryHandler(cb_risks, pattern=r"^rk:"))
