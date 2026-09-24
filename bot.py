@@ -1,4 +1,4 @@
-"""Web3 Project Scout — single-file Telegram bot."""
+"""Web3 Project Scout — single-file Telegram bot (fixed 2026-09-24)."""
 
 from __future__ import annotations
 
@@ -54,7 +54,6 @@ GECKO_CHAIN = {
     "xrp": "xrpl", "aptos": "aptos", "near": "near", "fantom": "fantom",
     "scroll": "scroll", "zksync": "zksync", "mantle": "mantle",
 }
-
 
 CMC_CHAIN_MAP = {
     "ethereum": "ethereum",
@@ -146,7 +145,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-23-risks-mcap-tg-v1"
+SCOUT_BUILD = "2026-09-24-fixed-kind-geckorate"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -175,7 +174,10 @@ Labels: 🔧 Utility · 🐸 Meme · ⚖️ Mixed
 """
 
 
-KEY_STATUS: dict[str, str] = {"gemini": "not set", "x": "not set", "xai": "not set", "groq": "not set", "openrouter": "not set", "llm_error": ""}
+KEY_STATUS: dict[str, str] = {
+    "gemini": "not set", "x": "not set", "xai": "not set",
+    "groq": "not set", "openrouter": "not set", "llm_error": "",
+}
 
 
 def env_secret(*names: str) -> str:
@@ -564,7 +566,6 @@ class DB:
             (user_id,),
         )
         return [dict(r) for r in await cur.fetchall()]
-
 
     async def get_snapshot(self, user_id: int, pid: int) -> dict[str, Any] | None:
         cur = await self.c.execute(
@@ -1091,7 +1092,6 @@ async def llm_write(prompt: str) -> str | None:
         "Sound like a real person who actually read the project."
     )
 
-    # --- Groq (best free, OpenAI-compatible) ---
     if groq:
         KEY_STATUS["groq"] = "present"
         models = [
@@ -1134,7 +1134,6 @@ async def llm_write(prompt: str) -> str | None:
     else:
         KEY_STATUS["groq"] = "missing"
 
-    # --- OpenRouter free models ---
     if openrouter:
         KEY_STATUS["openrouter"] = "present"
         models = [
@@ -1183,7 +1182,6 @@ async def llm_write(prompt: str) -> str | None:
     else:
         KEY_STATUS["openrouter"] = "missing"
 
-    # --- Gemini ---
     if gemini:
         KEY_STATUS["gemini"] = "present"
         models = [
@@ -1231,7 +1229,6 @@ async def llm_write(prompt: str) -> str | None:
     else:
         KEY_STATUS["gemini"] = "missing"
 
-    # --- xAI / OpenAI last ---
     providers: list[tuple[str, str, str]] = []
     if xai:
         for model in (
@@ -1328,9 +1325,7 @@ async def enrich_community(bot, client: httpx.AsyncClient, project: dict[str, An
 
 
 async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> dict[str, Any]:
-    """Best-effort free on-chain extras.
-    Solana: Rugcheck (creator + holders) + pump.fun when available.
-    """
+    """Best-effort free on-chain extras."""
     out: dict[str, Any] = {}
     chain = (project.get("chain") or "").lower()
     addr = (project.get("token_address") or "").strip()
@@ -1338,7 +1333,6 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
         return out
 
     if chain == "solana":
-        # 1) Rugcheck — free, reliable creator + totalHolders
         try:
             resp = await client.get(
                 f"https://api.rugcheck.xyz/v1/tokens/{addr}/report",
@@ -1368,7 +1362,6 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
         except Exception as exc:
             log.warning("rugcheck failed %s: %s", addr[:12], exc)
 
-        # 2) pump.fun fallback (often down, but try)
         if not out.get("deployer") or out.get("holders") is None:
             data = await http_get(client, f"https://frontend-api.pump.fun/coins/{addr}")
             if not isinstance(data, dict):
@@ -1389,11 +1382,10 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
                 if data.get("usd_market_cap") is not None:
                     out["pump_mcap"] = data.get("usd_market_cap")
 
-    # EVM free explorers (Blockscout-style counters) — best-effort
     blockscout = {
         "ethereum": "https://eth.blockscout.com",
         "base": "https://base.blockscout.com",
-        "bsc": "https://bsc.blockscout.com",  # may 404 on some hosts
+        "bsc": "https://bsc.blockscout.com",
         "arbitrum": "https://arbitrum.blockscout.com",
         "polygon": "https://polygon.blockscout.com",
         "optimism": "https://optimism.blockscout.com",
@@ -1409,20 +1401,15 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
                     out["holders"] = int(str(hc).replace(",", ""))
                 except ValueError:
                     pass
-        # creator via contract endpoint
         if not out.get("deployer"):
             cdata = await http_get(client, f"{base}/api/v2/smart-contracts/{addr}")
             if isinstance(cdata, dict) and cdata.get("creator_address_hash"):
                 out["deployer"] = cdata["creator_address_hash"]
-            else:
-                # fallback etherscan-style free is key-gated; skip
-                pass
 
     return out
 
 
 # ---------- reports ----------
-
 
 def project_snapshot(p: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -1467,7 +1454,6 @@ def snapshot_diffs(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
     if new.get("qualified") and not old.get("qualified"):
         signals.append("✅ Became public-facing (website or socials)")
     return signals
-
 
 
 def classify_project(p: dict[str, Any]) -> dict[str, Any]:
@@ -1526,9 +1512,7 @@ def classify_project(p: dict[str, Any]) -> dict[str, Any]:
     return {"label": "⚖️ Mixed", "type": "mixed"}
 
 
-
 def score_project(p: dict[str, Any]) -> dict[str, Any]:
-
     """Heuristic score for community / social opportunity — not a trade call."""
     score = 0
     roles: list[str] = []
@@ -1564,12 +1548,13 @@ def score_project(p: dict[str, Any]) -> dict[str, Any]:
     if comm.get("site_about") and not desc:
         score += 6
     kind = classify_project(p)
-    if kind["kind"] == "utility":
+    # FIXED: was kind["kind"] → KeyError. classify_project returns "type"
+    if kind.get("type") == "utility":
         score += 14
         if "Utility / product" not in roles:
             roles.append("Utility / product")
-    elif kind["kind"] == "meme":
-        score += 2  # still scorable for community work, but lower priority
+    elif kind.get("type") == "meme":
+        score += 2
     if p.get("docs"):
         score += 10
     else:
@@ -1747,7 +1732,6 @@ def report_text(p: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-
 def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
     pid = p["id"]
     rows: list[list[InlineKeyboardButton]] = [
@@ -1871,7 +1855,6 @@ def onchain_text(p: dict[str, Any]) -> str:
         "<i>Free data is incomplete on many chains — always cross-check explorer.</i>",
     ]
     return "\n".join(lines)
-
 
 
 async def approach_text(p: dict[str, Any]) -> str:
@@ -2028,7 +2011,6 @@ def social_alert_text(p: dict[str, Any], kinds: list[str]) -> str:
     return "\n".join(lines)
 
 
-
 def alert_text(p: dict[str, Any]) -> str:
     """Identity alert: clean, scannable, market cap visible."""
     s = score_project(p)
@@ -2074,7 +2056,6 @@ def alert_text(p: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-
 def source_label(p: dict[str, Any], *, for_alert: bool = False) -> str:
     """Badge for listing source. Alerts hide DexScreener noise; keep CMC/CG."""
     s = (p.get("source") or "").lower()
@@ -2083,12 +2064,11 @@ def source_label(p: dict[str, Any], *, for_alert: bool = False) -> str:
     if s in {"coingecko", "cg", "gecko-trending"}:
         return "🦎 CoinGecko"
     if for_alert:
-        # Dex / gecko discovery is default Scout path — no badge clutter
         return ""
     if s in {"gecko", "geckoterminal"}:
         return "🦎 GeckoTerminal"
     if s.startswith("dex") or s in {"dex-profile", "dex-pair", "dex-boost"}:
-        return ""  # don't show DexScreener label
+        return ""
     if s:
         return s
     return ""
@@ -2099,7 +2079,6 @@ def has_project_identity(p: dict[str, Any]) -> bool:
     return bool(p.get("website") or p.get("twitter") or p.get("telegram") or p.get("discord"))
 
 
-
 # ---------- app helpers ----------
 
 def allowed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2107,7 +2086,6 @@ def allowed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not owners:
         return True
     return user_id in owners
-
 
 
 async def safe_cb_answer(query, text: str | None = None, show_alert: bool = False) -> None:
@@ -2135,13 +2113,11 @@ async def safe_edit(query, text: str, reply_markup=None) -> None:
             return
         log.warning("edit_message failed: %s", exc)
         try:
-            # fallback: send new message so user still gets result
             await query.message.reply_html(
                 text, disable_web_page_preview=True, reply_markup=reply_markup
             )
         except Exception as exc2:
             log.warning("reply fallback failed: %s", exc2)
-
 
 
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2290,9 +2266,7 @@ async def render_page(update: Update, context: ContextTypes.DEFAULT_TYPE, since_
         text = header + "\n\n" + "\n\n".join(list_item(offset + i + 1, p) for i, p in enumerate(rows))
         markup = list_keyboard(rows, since_ts, offset, total)
     if edit and update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=markup
-        )
+        await safe_edit(update.callback_query, text, markup)
     elif update.effective_message:
         await update.effective_message.reply_html(text, disable_web_page_preview=True, reply_markup=markup)
 
@@ -2310,10 +2284,14 @@ async def cmd_newtokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cb_newtokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
-    await update.callback_query.answer()
-    _, since_s, offset_s = update.callback_query.data.split(":")
-    since_ts, offset = int(since_s), int(offset_s)
-    await render_page(update, context, since_ts, offset, ago(since_ts), edit=True)
+    await safe_cb_answer(update.callback_query)
+    try:
+        _, since_s, offset_s = update.callback_query.data.split(":")
+        since_ts, offset = int(since_s), int(offset_s)
+        await render_page(update, context, since_ts, offset, ago(since_ts), edit=True)
+    except Exception:
+        log.exception("cb_newtokens failed")
+        await safe_cb_answer(update.callback_query, "Error loading page", show_alert=True)
 
 
 async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2363,10 +2341,14 @@ async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not await gate(update, context):
         return
-    pid = int(update.callback_query.data.split(":")[1])
-    db, _ = deps(context)
-    await db.watch(update.effective_user.id, pid)
-    await update.callback_query.answer("Saved to /watchlist")
+    try:
+        pid = int(update.callback_query.data.split(":")[1])
+        db, _ = deps(context)
+        await db.watch(update.effective_user.id, pid)
+        await safe_cb_answer(update.callback_query, "Saved to /watchlist")
+    except Exception:
+        log.exception("cb_watch failed")
+        await safe_cb_answer(update.callback_query, "Error", show_alert=True)
 
 
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2374,7 +2356,7 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage:\\n/watch <project_id>\\n/watch <CA>\\n/watch chain:CA\\n\\n"
+            "Usage:\n/watch <project_id>\n/watch <CA>\n/watch chain:CA\n\n"
             "Scout will keep monitoring and alert when socials, liquidity, or activity appear — even while you are offline."
         )
         return
@@ -2403,10 +2385,10 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         missing.append("Website")
     miss = ", ".join(missing) if missing else "none (already public-facing)"
     await update.effective_message.reply_html(
-        f"⭐ <b>Watching</b> #{project['id']} {esc(title_of(project))}\\n"
-        f"⛓ {esc(chain)}\\n"
-        f"Monitoring for: socials · liquidity · volume · profile changes\\n"
-        f"Still missing: {esc(miss)}\\n"
+        f"⭐ <b>Watching</b> #{project['id']} {esc(title_of(project))}\n"
+        f"⛓ {esc(chain)}\n"
+        f"Monitoring for: socials · liquidity · volume · profile changes\n"
+        f"Still missing: {esc(miss)}\n"
         f"See /watchlist · alerts stay queued while you are offline."
     )
 
@@ -2487,6 +2469,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Last scan: {esc(ago(last_scan) if last_scan else 'not yet')}\n"
         f"Last command: {esc(ago(last_cmd) if last_cmd else 'none')}\n"
         f"Scanner: {'running' if context.application.bot_data.get('scan_alive') else 'restarting'}\n"
+        f"Build: {SCOUT_BUILD}\n"
         f"Groq: {esc(KEY_STATUS.get('groq') or 'not tried')} {'set' if env_secret('GROQ_API_KEY') else 'NOT in env'}\n"
         f"OpenRouter: {esc(KEY_STATUS.get('openrouter') or 'not tried')} {'set' if env_secret('OPENROUTER_API_KEY','OPENROUTER_KEY') else 'NOT in env'}\n"
         f"Gemini: {esc(KEY_STATUS.get('gemini') or 'not tried')}\n"
@@ -2526,132 +2509,122 @@ async def cmd_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-
 async def cb_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
-    await update.callback_query.answer("Building brief…")
-    pid = int(update.callback_query.data.split(":")[1])
+    q = update.callback_query
+    await safe_cb_answer(q, "Building brief…")
+    try:
+        pid = int(q.data.split(":")[1])
+    except Exception:
+        await safe_cb_answer(q, "Bad button", show_alert=True)
+        return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await update.callback_query.answer(
-            "That button is from before a restart. Send /jobs and open it again.",
-            show_alert=True,
-        )
+        await safe_cb_answer(q, "That button is from before a restart. Send /jobs and open it again.", show_alert=True)
         return
-    project = await enrich_one(db, client, project, context.bot)
-    text = await approach_text(project)
     try:
-        await update.callback_query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=report_keyboard(project),
-        )
+        project = await enrich_one(db, client, project, context.bot)
+        text = await approach_text(project)
+        await safe_edit(q, text, report_keyboard(project))
     except Exception as exc:
-        log.warning("edit approach failed: %s", exc)
-        # fallback only if edit fails (e.g. message too long / identical)
-        if update.callback_query.message:
-            await update.callback_query.message.reply_html(
-                text, disable_web_page_preview=True, reply_markup=report_keyboard(project)
-            )
+        log.exception("cb_approach failed")
+        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
 
 
 async def cb_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Same as approach but forces a fresh AI / fallback set and edits in place."""
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
-    await update.callback_query.answer("Shuffling…")
-    pid = int(update.callback_query.data.split(":")[1])
+    q = update.callback_query
+    await safe_cb_answer(q, "Shuffling…")
+    try:
+        pid = int(q.data.split(":")[1])
+    except Exception:
+        await safe_cb_answer(q, "Bad button", show_alert=True)
+        return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await update.callback_query.answer(
-            "That button is from before a restart. Send /jobs and open it again.",
-            show_alert=True,
-        )
+        await safe_cb_answer(q, "That button is from before a restart. Send /jobs and open it again.", show_alert=True)
         return
-    project = await enrich_one(db, client, project, context.bot)
-    text = await approach_text(project)
     try:
-        await update.callback_query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=report_keyboard(project),
-        )
+        project = await enrich_one(db, client, project, context.bot)
+        text = await approach_text(project)
+        await safe_edit(q, text, report_keyboard(project))
     except Exception as exc:
-        log.warning("edit shuffle failed: %s", exc)
+        log.exception("cb_shuffle failed")
+        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
 
 
 async def cb_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
-    await update.callback_query.answer("Analyzing gaps…")
-    pid = int(update.callback_query.data.split(":")[1])
-    db, client = deps(context)
-    project = await db.by_id(pid)
-    if not project:
-        await update.callback_query.answer("Expired button. Open /jobs again.", show_alert=True)
-        return
-    project = await enrich_one(db, client, project, context.bot)
-    text = await gaps_text(project)
+    q = update.callback_query
+    await safe_cb_answer(q, "Analyzing gaps…")
     try:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=report_keyboard(project)
-        )
-    except Exception as exc:
-        log.warning("edit gaps failed: %s", exc)
-
-async def cb_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
-        return
-    await update.callback_query.answer("Risks…")
-    try:
-        pid = int(update.callback_query.data.split(":")[1])
+        pid = int(q.data.split(":")[1])
     except Exception:
         return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await update.callback_query.answer("Expired — /jobs again", show_alert=True)
+        await safe_cb_answer(q, "Expired button. Open /jobs again.", show_alert=True)
         return
-    project = await enrich_one(db, client, project, context.bot)
-    text = await risks_text(project)
     try:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=report_keyboard(project)
-        )
+        project = await enrich_one(db, client, project, context.bot)
+        text = await gaps_text(project)
+        await safe_edit(q, text, report_keyboard(project))
     except Exception as exc:
-        log.warning("edit risks failed: %s", exc)
+        log.exception("cb_gaps failed")
+        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
 
+
+async def cb_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
+        return
+    q = update.callback_query
+    await safe_cb_answer(q, "Risks…")
+    try:
+        pid = int(q.data.split(":")[1])
+    except Exception:
+        return
+    db, client = deps(context)
+    project = await db.by_id(pid)
+    if not project:
+        await safe_cb_answer(q, "Expired — /jobs again", show_alert=True)
+        return
+    try:
+        project = await enrich_one(db, client, project, context.bot)
+        text = await risks_text(project)
+        await safe_edit(q, text, report_keyboard(project))
+    except Exception as exc:
+        log.exception("cb_risks failed")
+        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
 
 
 async def cb_onchain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
-    await update.callback_query.answer("On-chain…")
-    pid = int(update.callback_query.data.split(":")[1])
+    q = update.callback_query
+    await safe_cb_answer(q, "On-chain…")
+    try:
+        pid = int(q.data.split(":")[1])
+    except Exception:
+        return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await update.callback_query.answer(
-            "That button is from before a restart. Send /jobs and open it again.",
-            show_alert=True,
-        )
+        await safe_cb_answer(q, "That button is from before a restart. Send /jobs and open it again.", show_alert=True)
         return
-    project = await enrich_one(db, client, project, context.bot)
-    text = onchain_text(project)
     try:
-        await update.callback_query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=report_keyboard(project),
-        )
+        project = await enrich_one(db, client, project, context.bot)
+        text = onchain_text(project)
+        await safe_edit(q, text, report_keyboard(project))
     except Exception as exc:
-        log.warning("edit onchain failed: %s", exc)
+        log.exception("cb_onchain failed")
+        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
 
 
 async def cmd_early(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2734,8 +2707,6 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ---------- background loops ----------
 
-
-
 async def monitor_watches(app: Application) -> None:
     """Compare watched project snapshots and alert on meaningful changes."""
     db: DB = app.bot_data["db"]
@@ -2743,7 +2714,6 @@ async def monitor_watches(app: Application) -> None:
     rows = await db.all_watches()
     if not rows:
         return
-    # dedupe project enrich
     seen_pids: set[int] = set()
     for row in rows:
         uid = int(row["user_id"])
@@ -2788,7 +2758,7 @@ async def discovery_once(app: Application) -> None:
     db: DB = app.bot_data["db"]
     client: httpx.AsyncClient = app.bot_data["http"]
 
-    # DexScreener profiles (latest + recent updates) — multi-chain
+    # DexScreener profiles (latest + recent updates)
     for path in ("token-profiles/latest/v1", "token-profiles/recent-updates/v1"):
         profiles = await http_get(client, f"{DEX_API}/{path}")
         if isinstance(profiles, list):
@@ -2797,7 +2767,7 @@ async def discovery_once(app: Application) -> None:
                 if parsed.get("chain") in DEFAULT_CHAINS and parsed.get("token_address"):
                     await db.upsert(parsed)
 
-    # Boosted tokens sometimes include non-Solana early
+    # Boosted tokens
     boosted = await http_get(client, f"{DEX_API}/token-boosts/latest/v1")
     if isinstance(boosted, list):
         for raw in boosted:
@@ -2811,8 +2781,8 @@ async def discovery_once(app: Application) -> None:
                     "qualified": False,
                 })
 
-    # GeckoTerminal per-network new pools — spreads coverage beyond Solana
-    gecko_networks = [
+    # GeckoTerminal — FIXED: only a small rotating subset each cycle to avoid 429 storm
+    all_gecko = [
         ("solana", "solana"),
         ("eth", "ethereum"),
         ("base", "base"),
@@ -2833,7 +2803,10 @@ async def discovery_once(app: Application) -> None:
         ("sonic", "sonic"),
         ("monad", "monad"),
     ]
-    for network_id, _chain in gecko_networks:
+    # Rotate: take 4 networks per cycle based on current minute
+    start = (now() // 60) % max(1, len(all_gecko) - 3)
+    gecko_batch = all_gecko[start:start + 4]
+    for network_id, _chain in gecko_batch:
         gecko = await http_get(
             client,
             f"{GECKO_API}/networks/{network_id}/new_pools",
@@ -2844,7 +2817,7 @@ async def discovery_once(app: Application) -> None:
             for parsed in parse_gecko(gecko):
                 if parsed.get("chain") in DEFAULT_CHAINS:
                     await db.upsert(parsed)
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(1.2)  # respectful to free tier
 
     # Enrich a batch
     rows = await db.unenriched(16)
@@ -2891,8 +2864,6 @@ async def send_alerts(app: Application) -> None:
         if not user.get("alerts_enabled", 1):
             continue
         for project in await db.alert_candidates(user_id):
-            # Identity-only gate: qualified already means website/X/TG/discord present.
-            # Never alert on bare contract / liquidity / dex listing alone.
             if not is_qualified(project):
                 continue
             try:
@@ -2928,7 +2899,6 @@ async def send_social_alerts(app: Application) -> None:
                 await db.mark_social_alerted(ev["id"])
             continue
         kinds = [e["kind"] for e in evs]
-        # Only notify when real identity channels appear (not random noise)
         identity_kinds = [k for k in kinds if k in {"x", "telegram", "website", "discord"}]
         if not identity_kinds:
             for ev in evs:
@@ -2962,7 +2932,8 @@ async def discovery_loop(app: Application) -> None:
             last_cmd = int(app.bot_data.get("last_command_at") or 0)
             busy = last_cmd and (now() - last_cmd) < 30
             last_scan = int(app.bot_data.get("last_scan_at") or 0)
-            due = (now() - last_scan) >= int(os.getenv("DISCOVERY_INTERVAL_SEC", "30"))
+            interval = int(os.getenv("DISCOVERY_INTERVAL_SEC", "90"))  # safer default
+            due = (now() - last_scan) >= interval
             idle_kick = last_cmd and (now() - last_cmd) >= 30 and (now() - last_scan) >= 30
             if (due or idle_kick or not last_scan) and not busy:
                 await discovery_once(app)
@@ -2970,7 +2941,7 @@ async def discovery_loop(app: Application) -> None:
                 log.info("discovery cycle ok")
         except Exception:
             log.exception("discovery cycle failed")
-        await asyncio.sleep(4)
+        await asyncio.sleep(8)
 
 
 async def note_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3017,7 +2988,7 @@ async def on_start(app: Application) -> None:
         app.bot_data["allowed"] = [int(owner)]
     app.create_task(discovery_loop(app), name="scout-discovery")
     me = await app.bot.get_me()
-    log.info("Logged in as @%s", me.username)
+    log.info("Logged in as @%s  build=%s", me.username, SCOUT_BUILD)
 
 
 async def on_stop(app: Application) -> None:
@@ -3027,9 +2998,6 @@ async def on_stop(app: Application) -> None:
     db = app.bot_data.get("db")
     if db:
         await db.close()
-
-
-
 
 
 async def cmd_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3051,7 +3019,6 @@ async def cmd_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
@@ -3069,12 +3036,11 @@ async def cmd_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-
 async def gaps_text(p: dict[str, Any]) -> str:
-    """Meme-aware vs utility-aware gap analysis. No cookie-cutter whitepaper nagging for memes."""
+    """Meme-aware vs utility-aware gap analysis."""
     kind = classify_project(p)
     is_meme = kind.get("type") == "meme" or "🐸" in str(kind.get("label") or "") or "meme" in str(kind.get("label") or "").lower()
-    ctx = project_brief_for_llm(p) if "project_brief_for_llm" in dir() else _project_ctx(p)
+    ctx = _project_ctx(p)
 
     if is_meme:
         prompt = (
@@ -3097,7 +3063,7 @@ async def gaps_text(p: dict[str, Any]) -> str:
             "COMPETITOR_EDGE\nTRUST_GAPS\nCONTENT_OPPORTUNITIES\nFIXES\n"
             "No filler. Evidence-based only."
         )
-    out = await llm_complete(prompt) if False else await _llm_gaps(prompt)
+    out = await _scout_llm(prompt)
     header = [
         "🔍 <b>GAPS &amp; FIT</b>",
         f"<b>{esc(title_of(p))}</b> · {kind['label']}",
@@ -3105,13 +3071,9 @@ async def gaps_text(p: dict[str, Any]) -> str:
         "",
     ]
     if not out:
-        # heuristic fallback
         body = _gaps_fallback(p, is_meme)
         return "\n".join(header + body)
-    # format lightly
     text = out.replace("**", "")
-    lines = header + [esc(ln) if not ln.startswith("•") else ln for ln in text.splitlines()[:80]]
-    # Actually escape carefully
     pretty = []
     for ln in text.splitlines()[:90]:
         ln = ln.strip()
@@ -3162,18 +3124,6 @@ def _gaps_fallback(p: dict[str, Any], is_meme: bool) -> list[str]:
         "• What is non-replicable vs the nearest competitor?",
         "• Which admin powers remain on the contracts?",
     ]
-
-
-async def _llm_gaps(prompt: str) -> str:
-    """Use the bot's existing LLM stack if present."""
-    try:
-        # Scout may use different function names
-        if "llm_write" in globals():
-            return await llm_write(prompt)  # type: ignore
-    except Exception:
-        pass
-    # try inline via approach path - search for common complete function
-    return await _scout_llm(prompt)
 
 
 async def _scout_llm(prompt: str) -> str:
@@ -3269,7 +3219,6 @@ async def risks_text(p: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ask the AI for persona replies.
     Usage: /ask <id|CA> <question>
@@ -3284,8 +3233,6 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     db, client = deps(context)
-    # first token may be id, CA, or chain:CA — rest is question
-    # if chain:CA form, first arg is full query
     first = args[0]
     if ":" in first and not first.isdigit():
         query = first
@@ -3294,7 +3241,6 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = first
         question = " ".join(args[1:]).strip()
     else:
-        # ambiguous — try whole as CA only if one arg left
         query = first
         question = " ".join(args[1:]).strip()
     if not question:
@@ -3311,20 +3257,19 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-
 async def ask_personas_text(p: dict[str, Any], question: str) -> str:
     s = score_project(p)
     comm = community(p)
     what = p.get("description") or comm.get("site_about") or comm.get("tg_about") or "Thin public description."
     kind = classify_project(p)
     prompt = (
-        f"Project: {title_of(p)}\\nChain: {p.get('chain')}\\nType: {kind['label']}\\n"
-        f"Website: {p.get('website')}\\nX: {p.get('twitter')}\\nTelegram: {p.get('telegram')}\\n"
-        f"About: {what}\\n"
-        f"Community question (from chat or user):\\n{question}\\n\\n"
+        f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
+        f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTelegram: {p.get('telegram')}\n"
+        f"About: {what}\n"
+        f"Community question (from chat or user):\n{question}\n\n"
         f"Write reply options a community operator could post. "
-        f"Use these labels exactly, each 1-2 sentences, human, specific to THIS product:\\n"
-        f"CURIOUS\\nINVESTOR\\nSUGGESTION\\nQUESTION\\nSUPPORTER\\nSTRATEGIST\\nRANDOM\\n"
+        f"Use these labels exactly, each 1-2 sentences, human, specific to THIS product:\n"
+        f"CURIOUS\nINVESTOR\nSUGGESTION\nQUESTION\nSUPPORTER\nSTRATEGIST\nRANDOM\n"
         f"No hashtags dump. No investment advice. Variation seed {random.randint(1,9999)}."
     )
     generated = await llm_write(prompt)
@@ -3350,9 +3295,7 @@ async def ask_personas_text(p: dict[str, Any], question: str) -> str:
             "<b>QUESTION</b>",
             "<code>Is this answered in docs, or only in voice chats / AMAs?</code>",
         ]
-    return "\\n".join(header + body + ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}"])
-
-
+    return "\n".join(header + body + ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}"])
 
 
 async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3408,7 +3351,6 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not (homepage or tw or tg or chat):
                 continue
             platforms = detail.get("platforms") or {}
-            # platforms: { "ethereum": "0x...", "solana": "..." }
             chain, addr = None, None
             for plat, contract in platforms.items():
                 if not contract:
@@ -3419,7 +3361,6 @@ async def cmd_cg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     if chain in DEFAULT_CHAINS:
                         break
             if not addr:
-                # no contract — skip (can't investigate as CA project)
                 continue
             if chain not in DEFAULT_CHAINS:
                 chain = "ethereum" if addr.startswith("0x") else chain
@@ -3503,7 +3444,6 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             plat_name = (plat.get("name") or plat.get("slug") or "").lower()
             chain = CMC_CHAIN_MAP.get(plat_name) or CMC_CHAIN_MAP.get((plat.get("slug") or "").lower())
             if not chain:
-                # fuzzy
                 for key, val in CMC_CHAIN_MAP.items():
                     if key in plat_name:
                         chain = val
@@ -3536,14 +3476,12 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                             telegram = u
                         elif "discord" in u.lower():
                             discord = u
-                    # platforms fallback for contract
                     platforms = (d or {}).get("platforms") or []
                     if platforms and not addr:
                         addr = platforms[0].get("contractAddress") or addr
                         chain = CMC_CHAIN_MAP.get((platforms[0].get("contractPlatform") or "").lower(), chain)
             if not (website or twitter or telegram or discord):
                 continue
-            # Only newly listed (last 7 days)
             added_raw = c.get("dateAdded") or ""
             try:
                 if isinstance(added_raw, str) and "T" in added_raw:
@@ -3597,7 +3535,6 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -3642,7 +3579,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_gaps, pattern=r"^gp:"))
     app.add_handler(CallbackQueryHandler(cb_risks, pattern=r"^rk:"))
     app.add_handler(CallbackQueryHandler(cb_watch, pattern=r"^w:"))
-    log.info("Polling Telegram…")
+    log.info("Polling Telegram… build=%s", SCOUT_BUILD)
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
 
