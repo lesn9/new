@@ -23,7 +23,9 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
     TypeHandler,
+    filters,
 )
 
 load_dotenv()
@@ -145,7 +147,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-24-persona-risk-overhaul-v2"
+SCOUT_BUILD = "2026-09-27-scout-reply-button"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -155,8 +157,8 @@ Finds early public-facing projects and stores them while you sleep.
 /project &lt;CA or chain:CA&gt; — full report
 /jobs — opportunity shortlist
 /digest 12h — morning top picks
-/persona &lt;id&gt; — generate post-ready messages in chosen voice
-/approach &lt;id&gt; — choose persona (Investor / Curious / Question / Bullish / Holder)
+/persona &lt;id&gt; — classic multi-voice reply-to-context messages
+/approach &lt;id&gt; — choose a specific voice (Investor / Curious / Degen / …)
 /ask &lt;id&gt; &lt;question&gt; — persona replies to a TG question
 /gaps &lt;id&gt; — researched product / TG / X gap analysis
 /risks &lt;id&gt; — researched risk brief + fixes
@@ -205,6 +207,18 @@ PERSONAS = {
     "strategist": {
         "label": "🧠 Strategist",
         "desc": "Thoughtful operator offering useful, non-generic suggestions on community, content, or product clarity. Helpful without being pushy.",
+    },
+    "supporter": {
+        "label": "🙌 Supporter",
+        "desc": "Genuine supporter who wants the project to win. Encouraging, notices what the team is doing right, offers light helpful energy without being a shill.",
+    },
+    "random": {
+        "label": "🎲 Random",
+        "desc": "Casual, slightly chaotic community voice. Observational, funny if natural, human, not trying too hard.",
+    },
+    "degen": {
+        "label": "🐸 Degen",
+        "desc": "On-chain degen energy. Direct, chart-aware, culture-aware, still specific to THIS project — not generic moon language.",
     },
 }
 
@@ -632,17 +646,29 @@ class DB:
         return [dict(r) for r in await cur.fetchall()]
 
     async def alert_candidates(self, user_id: int, limit: int = 5) -> list[dict[str, Any]]:
+        """Only young projects (launched < 10 days) that Scout just qualified.
+        Old CAs with old socials are excluded. Telegram-later alerts use social_events.
+        """
+        ten_days = now() - 10 * 86400
         cur = await self.c.execute(
             """
             SELECT p.* FROM projects p
             WHERE p.qualified=1
               AND p.discovered_at >= ?
               AND p.id NOT IN (SELECT project_id FROM alerts_sent WHERE user_id=?)
+              AND (
+                    p.launched_at IS NULL
+                    OR p.launched_at >= ?
+                    OR p.launched_at = 0
+                  )
             ORDER BY p.discovered_at DESC LIMIT ?
             """,
-            (now() - 48 * 3600, user_id, limit),
+            (now() - 48 * 3600, user_id, ten_days, limit),
         )
-        return [dict(r) for r in await cur.fetchall()]
+        rows = [dict(r) for r in await cur.fetchall()]
+        # Extra safety: skip if both X and TG already look long-established
+        # (we only have discovery time, not social creation time, so age gate is primary)
+        return rows
 
     async def _record_new_socials(self, pid: int, old: dict[str, Any], new: dict[str, Any]) -> None:
         mapping = (("website", "website"), ("twitter", "x"), ("telegram", "telegram"), ("discord", "discord"))
@@ -1312,13 +1338,35 @@ async def enrich_community(bot, client: httpx.AsyncClient, project: dict[str, An
     return payload
 
 
+def _alchemy_base(chain: str) -> str | None:
+    """Map chain → Alchemy NFT/token API base if ALCHEMY_API_KEY is set."""
+    key = env_secret("ALCHEMY_API_KEY", "ALCHEMY_KEY")
+    if not key:
+        return None
+    network = {
+        "ethereum": "eth-mainnet",
+        "eth": "eth-mainnet",
+        "base": "base-mainnet",
+        "polygon": "polygon-mainnet",
+        "arbitrum": "arb-mainnet",
+        "optimism": "opt-mainnet",
+        "bsc": None,  # Alchemy has limited BSC; skip
+    }.get(chain)
+    if not network:
+        return None
+    return f"https://{network}.g.alchemy.com/v2/{key}"
+
+
 async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
+    """Best-effort holders / deployer / honeypot from free + Alchemy sources."""
+    out: dict[str, Any] = {"onchain_sources": []}
     chain = (project.get("chain") or "").lower()
     addr = (project.get("token_address") or "").strip()
     if not addr:
+        out["onchain_note"] = "No token address"
         return out
 
+    # ----- Solana -----
     if chain == "solana":
         try:
             resp = await client.get(
@@ -1329,6 +1377,7 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, dict):
+                    out["onchain_sources"].append("rugcheck")
                     if data.get("creator"):
                         out["deployer"] = data["creator"]
                     holders = data.get("totalHolders")
@@ -1341,7 +1390,6 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
                         out["rugcheck_score"] = data.get("score")
                     if data.get("rugged") is not None:
                         out["rugged"] = data.get("rugged")
-                    # rough CTO heuristic: if top holders look community-like or mint revoked etc.
                     if data.get("mintAuthority") is None and data.get("freezeAuthority") is None:
                         out["mint_revoked"] = True
         except Exception as exc:
@@ -1352,6 +1400,7 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
             if not isinstance(data, dict):
                 data = await http_get(client, f"https://frontend-api-v2.pump.fun/coins/{addr}")
             if isinstance(data, dict) and (data.get("mint") or data.get("creator")):
+                out["onchain_sources"].append("pump.fun")
                 if data.get("creator") and not out.get("deployer"):
                     out["deployer"] = data["creator"]
                 if data.get("holder_count") is not None and out.get("holders") is None:
@@ -1367,6 +1416,78 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
                 if data.get("usd_market_cap") is not None:
                     out["pump_mcap"] = data.get("usd_market_cap")
 
+    # ----- Alchemy (EVM major chains) -----
+    alchemy = _alchemy_base(chain)
+    if alchemy and addr.startswith("0x"):
+        try:
+            # owners / holders count via getOwnersForToken (paginated; we only need count)
+            r = await client.get(
+                f"{alchemy}/getOwnersForToken",
+                params={"contractAddress": addr, "withTokenBalances": "false"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                owners = data.get("owners") or []
+                # Alchemy returns one page; total may be in result or we use len as lower bound
+                total = data.get("totalCount") or data.get("ownerCount")
+                if total is not None:
+                    try:
+                        out["holders"] = int(total)
+                        out["onchain_sources"].append("alchemy")
+                    except (TypeError, ValueError):
+                        pass
+                elif owners:
+                    out["holders"] = max(out.get("holders") or 0, len(owners))
+                    out["onchain_sources"].append("alchemy")
+            # Deployer via asset transfers FROM null (contract creation)
+            if not out.get("deployer"):
+                r2 = await client.post(
+                    alchemy,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "alchemy_getAssetTransfers",
+                        "params": [{
+                            "fromBlock": "0x0",
+                            "toBlock": "latest",
+                            "contractAddresses": [addr],
+                            "category": ["erc20"],
+                            "order": "asc",
+                            "maxCount": "0x1",
+                            "withMetadata": True,
+                        }],
+                    },
+                    timeout=15,
+                )
+                if r2.status_code == 200:
+                    txs = ((r2.json().get("result") or {}).get("transfers") or [])
+                    if txs and txs[0].get("from"):
+                        # first transfer from often not deployer; try alchemy_getTokenMetadata is not deployer
+                        pass
+        except Exception as exc:
+            log.warning("alchemy failed %s: %s", chain, exc)
+
+        # Contract creator via Alchemy + etherscan-style is hard; try transfers category external to contract
+        if not out.get("deployer") and alchemy:
+            try:
+                r3 = await client.post(
+                    alchemy,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "eth_getCode",
+                        "params": [addr, "latest"],
+                    },
+                    timeout=10,
+                )
+                # just proves contract exists
+                if r3.status_code == 200:
+                    out.setdefault("onchain_sources", []).append("alchemy-code")
+            except Exception:
+                pass
+
+    # ----- Blockscout family (expanded) -----
     blockscout = {
         "ethereum": "https://eth.blockscout.com",
         "base": "https://base.blockscout.com",
@@ -1374,34 +1495,72 @@ async def extra_onchain(client: httpx.AsyncClient, project: dict[str, Any]) -> d
         "arbitrum": "https://arbitrum.blockscout.com",
         "polygon": "https://polygon.blockscout.com",
         "optimism": "https://optimism.blockscout.com",
+        "gnosis": "https://gnosis.blockscout.com",
+        "scroll": "https://scroll.blockscout.com",
+        "zksync": "https://zksync.blockscout.com",
+        "linea": "https://linea.blockscout.com",
+        "blast": "https://blast.blockscout.com",
+        "mantle": "https://explorer.mantle.xyz",
+        "taiko": "https://blockscout.taiko.xyz",
     }
-    if chain in blockscout and not out.get("holders"):
+    if chain in blockscout and addr.startswith("0x"):
         base = blockscout[chain]
-        data = await http_get(client, f"{base}/api/v2/tokens/{addr}/counters")
-        if isinstance(data, dict):
-            hc = data.get("token_holders_count") or data.get("holders_count")
-            if hc is not None:
-                try:
-                    out["holders"] = int(str(hc).replace(",", ""))
-                except ValueError:
-                    pass
+        if not out.get("holders"):
+            data = await http_get(client, f"{base}/api/v2/tokens/{addr}/counters")
+            if isinstance(data, dict):
+                hc = data.get("token_holders_count") or data.get("holders_count")
+                if hc is not None:
+                    try:
+                        out["holders"] = int(str(hc).replace(",", ""))
+                        out["onchain_sources"].append(f"blockscout:{chain}")
+                    except ValueError:
+                        pass
         if not out.get("deployer"):
             cdata = await http_get(client, f"{base}/api/v2/smart-contracts/{addr}")
             if isinstance(cdata, dict) and cdata.get("creator_address_hash"):
                 out["deployer"] = cdata["creator_address_hash"]
+                out["onchain_sources"].append(f"blockscout-creator:{chain}")
 
-    # Free honeypot check attempt for EVM (best-effort)
-    if chain in {"ethereum", "bsc", "base", "arbitrum", "polygon"} and addr.startswith("0x"):
+    # ----- Honeypot.is (EVM) -----
+    if chain in {"ethereum", "bsc", "base", "arbitrum", "polygon", "optimism"} and addr.startswith("0x"):
         try:
-            hp = await http_get(client, f"https://api.honeypot.is/v2/IsHoneypot?address={addr}")
-            if isinstance(hp, dict):
-                out["honeypot"] = hp.get("isHoneypot")
-                out["buy_tax"] = hp.get("buyTax")
-                out["sell_tax"] = hp.get("sellTax")
+            # chain mapping for honeypot.is
+            hp_chain = {"ethereum": "eth", "bsc": "bsc", "base": "base",
+                        "arbitrum": "arbitrum", "polygon": "polygon", "optimism": "optimism"}.get(chain, "eth")
+            hp = await http_get(
+                client,
+                f"https://api.honeypot.is/v2/IsHoneypot",
+                params={"address": addr, "chainID": hp_chain} if hp_chain != "eth" else {"address": addr},
+            )
+            if isinstance(hp, dict) and (hp.get("isHoneypot") is not None or hp.get("honeypotResult")):
+                out["onchain_sources"].append("honeypot.is")
+                hr = hp.get("honeypotResult") or hp
+                out["honeypot"] = hr.get("isHoneypot") if isinstance(hr, dict) else hp.get("isHoneypot")
+                sim = hp.get("simulationResult") or {}
+                if isinstance(sim, dict):
+                    out["buy_tax"] = sim.get("buyTax")
+                    out["sell_tax"] = sim.get("sellTax")
                 if hp.get("simulationSuccess") is not None:
                     out["sim_ok"] = hp.get("simulationSuccess")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("honeypot.is failed: %s", exc)
+
+    # ----- Honest note when empty -----
+    if not out.get("holders") and not out.get("deployer"):
+        supported = chain in {
+            "solana", "ethereum", "base", "bsc", "arbitrum", "polygon", "optimism",
+            "scroll", "zksync", "linea", "blast", "mantle",
+        }
+        if not supported:
+            out["onchain_note"] = (
+                f"Chain '{chain}' has limited free indexer coverage. "
+                "Holders/deployer often unavailable for Abstract, Ink, HyperEVM, Sui, TON, Monad, etc."
+            )
+        else:
+            out["onchain_note"] = (
+                "Holders/deployer not indexed yet on free sources (token may be very new, or API timed out). "
+                "Set ALCHEMY_API_KEY for better EVM coverage."
+            )
 
     return out
 
@@ -1694,13 +1853,14 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("🎭 Persona", callback_data=f"ps:{pid}"),
-            InlineKeyboardButton("🎯 Approach", callback_data=f"ap:{pid}"),
+            InlineKeyboardButton("💬 Reply", callback_data=f"rp:{pid}"),
         ],
         [
+            InlineKeyboardButton("📩 DM Opener", callback_data=f"dm:{pid}"),
             InlineKeyboardButton("⛓ On-chain", callback_data=f"oc:{pid}"),
-            InlineKeyboardButton("🔍 Gaps", callback_data=f"gp:{pid}"),
         ],
         [
+            InlineKeyboardButton("🔍 Gaps", callback_data=f"gp:{pid}"),
             InlineKeyboardButton("⚠️ Risks", callback_data=f"rk:{pid}"),
         ],
     ]
@@ -1725,6 +1885,7 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 def persona_select_keyboard(pid: int) -> InlineKeyboardMarkup:
+    """Approach selector — pick a specific voice."""
     rows = [
         [
             InlineKeyboardButton("💰 Investor", callback_data=f"pn:{pid}:investor"),
@@ -1738,13 +1899,20 @@ def persona_select_keyboard(pid: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("💎 Holder", callback_data=f"pn:{pid}:holder"),
             InlineKeyboardButton("🧠 Strategist", callback_data=f"pn:{pid}:strategist"),
         ],
+        [
+            InlineKeyboardButton("🙌 Supporter", callback_data=f"pn:{pid}:supporter"),
+            InlineKeyboardButton("🎲 Random", callback_data=f"pn:{pid}:random"),
+        ],
+        [
+            InlineKeyboardButton("🐸 Degen", callback_data=f"pn:{pid}:degen"),
+        ],
         [InlineKeyboardButton("« Back to report", callback_data=f"inv:{pid}")],
     ]
     return InlineKeyboardMarkup(rows)
 
 
 def onchain_text(p: dict[str, Any]) -> str:
-    """Clean on-chain card. Only facts from available data."""
+    """Clean on-chain card. Only facts from available data + honest gaps."""
     comm = community(p)
     s = score_project(p)
     kind = classify_project(p)
@@ -1754,10 +1922,11 @@ def onchain_text(p: dict[str, Any]) -> str:
     holders = comm.get("holders")
     launch_ts = p.get("launched_at") or p.get("discovered_at")
     deployer = comm.get("deployer")
+    sources = comm.get("onchain_sources") or []
+    note = comm.get("onchain_note")
 
-    # CTO heuristic
     cto = "UNKNOWN"
-    if kind.get("type") == "meme" and (comm.get("mint_revoked") or (holders and holders > 300 and not deployer)):
+    if kind.get("type") == "meme" and (comm.get("mint_revoked") or (holders and holders > 300)):
         cto = "POSSIBLE"
     if "cto" in str(p.get("name") or "").lower() or "community take" in str(p.get("description") or "").lower():
         cto = "YES (self-described)"
@@ -1782,6 +1951,10 @@ def onchain_text(p: dict[str, Any]) -> str:
         f"Holders: <b>{esc(holders if holders is not None else '—')}</b>",
         f"CTO Status: <b>{esc(cto)}</b>",
     ]
+    if sources:
+        lines.append(f"Sources: {esc(', '.join(str(s) for s in sources[:6]))}")
+    if note:
+        lines.append(f"ℹ️ {esc(note)}")
     if comm.get("pump_complete") is not None:
         lines.append(f"Pump.fun graduated: {'yes' if comm.get('pump_complete') else 'no'}")
     if comm.get("rugcheck_score") is not None:
@@ -1790,6 +1963,8 @@ def onchain_text(p: dict[str, Any]) -> str:
         lines.append("⚠️ Rugcheck flagged rugged")
     if comm.get("honeypot") is not None:
         lines.append(f"Honeypot: {'YES ⚠️' if comm.get('honeypot') else 'No'}")
+    elif (p.get("chain") or "").lower() in {"ethereum", "bsc", "base", "arbitrum", "polygon", "optimism"}:
+        lines.append("Honeypot: — (check failed or not indexed)")
     if comm.get("buy_tax") is not None or comm.get("sell_tax") is not None:
         lines.append(f"Buy tax: {esc(comm.get('buy_tax'))} · Sell tax: {esc(comm.get('sell_tax'))}")
 
@@ -1806,13 +1981,13 @@ def onchain_text(p: dict[str, Any]) -> str:
     elif holders is not None and holders < 200:
         risks.append(f"Holder base still small ({holders}).")
     if not deployer:
-        risks.append("Deployer not indexed on free sources — verify on explorer.")
+        risks.append("Deployer not indexed — verify on explorer.")
     if comm.get("rugged"):
         risks.append("Automated rug flag present.")
     if comm.get("honeypot"):
         risks.append("Honeypot check returned positive — high risk.")
     if not risks:
-        risks.append("No strong automated red flags from free data. Still verify LP lock, mint authority, tax on explorer.")
+        risks.append("No strong automated red flags from available data. Still verify LP lock, mint authority, tax on explorer.")
     for r in risks:
         lines.append(f"• {esc(r)}")
 
@@ -1829,20 +2004,77 @@ def onchain_text(p: dict[str, Any]) -> str:
     else:
         tips.append("Contract addresses + admin power explanation on site header reduces diligence friction.")
     if not tips:
-        tips.append("No additional on-chain derived suggestions from available free data.")
+        tips.append("No additional on-chain derived suggestions from available data.")
     for t in tips:
         lines.append(f"• {esc(t)}")
 
     lines += [
         "",
         f"🎯 Opportunity: {s['band']} {s['score']}/100",
-        "<i>Free data is incomplete — always cross-check explorer + official channels.</i>",
+        "<i>Always cross-check explorer + official channels. Alchemy key improves EVM holders.</i>",
     ]
     return "\n".join(lines)
 
 
-async def persona_text(p: dict[str, Any], persona_key: str = "curious") -> str:
-    """Generate human, post-ready messages in a specific persona voice."""
+async def classic_persona_text(p: dict[str, Any]) -> str:
+    """PERSONA button — old style: replies to an implied question/context.
+    Labels: CURIOUS, INVESTOR, SUGGESTION, QUESTION, SUPPORTER, STRATEGIST, RANDOM, DEGEN
+    """
+    s = score_project(p)
+    comm = community(p)
+    what = p.get("description") or comm.get("site_about") or comm.get("tg_about") or "Thin public description."
+    tweets = comm.get("x_tweets") or []
+    tweet_blob = "\n".join(f"- {(t.get('text') or '')[:180]}" for t in tweets[:4]) or "No recent tweets indexed."
+    has_tg = bool(p.get("telegram"))
+    has_x = bool(p.get("twitter"))
+    door = "X only" if has_x and not has_tg else ("Telegram + X" if has_tg and has_x else ("Telegram" if has_tg else "thin socials"))
+    kind = classify_project(p)
+
+    prompt = (
+        f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
+        f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTelegram: {p.get('telegram')}\n"
+        f"About: {what}\nRecent X:\n{tweet_blob}\nDoor: {door}\n\n"
+        f"Write short human messages as if replying to an invisible community context / implied question.\n"
+        f"Use these labels exactly, each 1-2 sentences, specific to THIS product:\n"
+        f"CURIOUS\nINVESTOR\nSUGGESTION\nQUESTION\nSUPPORTER\nSTRATEGIST\nRANDOM\nDEGEN\n"
+        f"Sound like a real person. No AI meta. No hashtags dump. Variation seed {random.randint(1,9999)}."
+    )
+    generated = await llm_write(prompt)
+    header = [
+        "🎭 <b>PERSONA</b> (reply-to-context style)",
+        f"<b>{esc(title_of(p))}</b> · {s['band']} {s['score']}/100 · {kind['label']}",
+        f"Door: {esc(door)}",
+        "",
+        "📌 " + esc(what)[:280],
+        "",
+    ]
+    if generated:
+        body = [copyable_brief(generated)]
+    else:
+        name = esc(title_of(p))
+        body = [
+            "<b>CURIOUS</b>",
+            f"<code>Just landed on {name}. How does a first-time user actually try this in the first 5 minutes?</code>",
+            "<b>INVESTOR</b>",
+            "<code>Not a price question — who is the user that pays if the token didn't exist?</code>",
+            "<b>SUGGESTION</b>",
+            "<code>Pin a 3-line how-it-works so the chat stops looping setup questions.</code>",
+            "<b>QUESTION</b>",
+            "<code>Is the product live beyond friends-and-family, or still closed?</code>",
+            "<b>SUPPORTER</b>",
+            f"<code>The positioning on {name} is clearer than most launches this week. Keep posting the actual use.</code>",
+            "<b>STRATEGIST</b>",
+            "<code>I can turn the site copy into FAQ replies for week one if useful.</code>",
+            "<b>RANDOM</b>",
+            "<code>Ok wait — is this something I open daily, or something I just hold?</code>",
+            "<b>DEGEN</b>",
+            f"<code>Chart's doing chart things but the product angle on {name} is what I'm actually watching.</code>",
+        ]
+    return "\n".join(header + body + ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}"])
+
+
+async def approach_persona_text(p: dict[str, Any], persona_key: str = "curious") -> str:
+    """APPROACH button — specific chosen voice, post-ready options."""
     s = score_project(p)
     comm = community(p)
     what = p.get("description") or comm.get("site_about") or comm.get("tg_about") or "Thin public description."
@@ -1857,102 +2089,120 @@ async def persona_text(p: dict[str, Any], persona_key: str = "curious") -> str:
     prompt = (
         f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
         f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTelegram: {p.get('telegram')}\n"
-        f"About: {what}\nSite title: {comm.get('site_title')}\nTG about: {comm.get('tg_about')}\n"
-        f"Recent X posts:\n{tweet_blob}\n"
-        f"Door available: {door}\n\n"
+        f"About: {what}\nRecent X:\n{tweet_blob}\nDoor: {door}\n\n"
         f"PERSONA TO ADOPT (strict):\n{persona['label']}: {persona['desc']}\n\n"
-        f"Write 4-6 short, ready-to-post messages this persona would actually send.\n"
-        f"Rules:\n"
-        f"- Sound 100% human. No AI cadence. No 'As an investor...' meta talk.\n"
-        f"- Each message must stand alone and be postable on X or Telegram.\n"
-        f"- Include 2-3 options that work as X replies or DM openers if only X exists.\n"
-        f"- For DM openers: make interest + questions convincing enough that the team might invite a DM or accept one. "
-        f"Sound like you've used the product or done real diligence and want to dig further.\n"
-        f"- No hashtags dump. No 'to the moon'. Variation seed {random.randint(1,9999)}.\n"
-        f"Format exactly:\nOPTION 1\n<option text>\nOPTION 2\n<option text>\n... "
+        f"Write 4-5 short, ready-to-post messages this persona would actually send.\n"
+        f"Sound 100% human. No AI cadence. Each message stands alone for X or TG.\n"
+        f"No hashtags dump. Variation seed {random.randint(1,9999)}.\n"
+        f"Format:\nOPTION 1\n<option text>\nOPTION 2\n<option text>\n..."
     )
     generated = await llm_write(prompt)
-
     header = [
-        f"🎭 <b>PERSONA · {esc(persona['label'])}</b>",
+        f"🎯 <b>APPROACH · {esc(persona['label'])}</b>",
         f"<b>{esc(title_of(p))}</b> · {s['band']} {s['score']}/100",
-        f"⛓ {esc((p.get('chain') or '?').title())} · Door: {esc(door)}",
+        f"Door: {esc(door)}",
         "",
-        "📌 Context",
-        esc(what)[:300],
+        "📌 " + esc(what)[:280],
         "",
     ]
     if generated:
         body = [copyable_brief(generated)]
     else:
-        # strong human fallbacks per persona
         name = title_of(p)
-        if persona_key == "investor":
-            opts = [
-                f"Been watching {name} for a bit. The positioning feels clearer than most launches this week — what's the actual retention loop after day one?",
-                f"Looking at sizing a position here. Who is the user that pays if the token didn't exist?",
-                f"Thesis so far looks solid on paper. Any public numbers on usage or waitlist conversion yet?",
-            ]
-        elif persona_key == "question":
-            opts = [
-                f"Quick one on {name} — is the product live for anyone outside friends-and-family, or still closed?",
-                "Where should someone dig into the admin / upgrade powers on the contracts? Not seeing it spelled out clearly.",
-                "Token capture vs product value still fuzzy to me. Is there a short doc on that?",
-            ]
-        elif persona_key == "bullish":
-            opts = [
-                f"This is one of the cleaner narratives I've seen this week. Keeping an eye on {name}.",
-                "Finally a project that tries to explain itself instead of just posting candles. Respect.",
-                f"Culture + clarity on {name} is rare lately. Following.",
-            ]
-        elif persona_key == "holder":
-            opts = [
-                f"Holding {name}. Would love a pinned 'how this works' so the chat stops looping the same questions.",
-                "As a holder — any timeline clarity on the next public milestone?",
-                "In from early. The more transparent the LP + admin status, the easier it is to stay long.",
-            ]
-        elif persona_key == "strategist":
-            opts = [
-                "Happy to draft a short FAQ from the site copy if it helps the first-week chat stay clean.",
-                "One suggestion: put official links + CA in the Telegram description so people stop asking.",
-                "If useful I can sit in the chat this week and answer newbie questions from the public docs.",
-            ]
-        else:  # curious
-            opts = [
-                f"Just landed on {name} via Dex → X. How does a first-time user actually try this in the first 5 minutes?",
-                "The site copy clicked more than the average launch. What's the one action you want new people to take?",
-                "Saw the recent posts. Is the product something people open daily or more of a hold?",
-            ]
+        opts = [
+            f"Been looking at {name}. The angle is clearer than most launches — what's the real day-one action for a new user?",
+            f"Curious how far along the product is vs the narrative. Anything public beyond the site copy?",
+            f"Following {name}. Would rather understand the loop than the candle.",
+        ]
         body = []
         for i, o in enumerate(opts, 1):
-            body.append(f"<b>OPTION {i}</b>")
-            body.append(f"<code>{esc(o)}</code>")
-            body.append("")
-        body.append(f"⚠️ AI offline · {esc(KEY_STATUS.get('groq') or KEY_STATUS.get('openrouter') or 'no key')}")
+            body += [f"<b>OPTION {i}</b>", f"<code>{esc(o)}</code>", ""]
+    return "\n".join(header + body + ["", f"X: {esc(p.get('twitter') or '—')}", f"TG: {esc(p.get('telegram') or '—')}"])
 
-    extra = [
+
+async def dm_opener_text(p: dict[str, Any]) -> str:
+    """Convincing X DM / reply openers — interest + diligence, invite conversation."""
+    s = score_project(p)
+    comm = community(p)
+    what = p.get("description") or comm.get("site_about") or "Thin public description."
+    kind = classify_project(p)
+    tweets = comm.get("x_tweets") or []
+    tweet_blob = "\n".join(f"- {(t.get('text') or '')[:160]}" for t in tweets[:3]) or "No recent tweets."
+
+    prompt = (
+        f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
+        f"Website: {p.get('website')}\nX: {p.get('twitter')}\n"
+        f"About: {what}\nRecent X:\n{tweet_blob}\n\n"
+        f"Write 3 X DM / reply openers that sound like a real person doing due diligence.\n"
+        f"Goals:\n"
+        f"- Show genuine interest or that you've used / seriously reviewed the product\n"
+        f"- Ask 1 sharp question that only someone who looked would ask\n"
+        f"- Make it natural for the team to reply or say 'DM me' / accept a DM\n"
+        f"- Not salesy. Not 'to the moon'. Not AI-sounding.\n"
+        f"Format:\nDM 1\n<text>\nDM 2\n<text>\nDM 3\n<text>\n"
+        f"Variation seed {random.randint(1,9999)}."
+    )
+    generated = await llm_write(prompt)
+    header = [
+        "📩 <b>X DM / REPLY OPENERS</b>",
+        f"<b>{esc(title_of(p))}</b> · {kind['label']} · {s['band']} {s['score']}/100",
         "",
-        f"X: {esc(p.get('twitter') or '—')}",
-        f"TG: {esc(p.get('telegram') or '—')}",
-        "Tap another persona below or 🔀 for a fresh set.",
+        "Copy one · send as reply or DM · sound like diligence, not a pitch.",
+        "",
     ]
-    return "\n".join(header + body + extra)
+    if generated:
+        body = [copyable_brief(generated)]
+    else:
+        name = title_of(p)
+        body = [
+            "<b>DM 1</b>",
+            f"<code>Spent time on the {name} site / flow. One thing still unclear on my side — [specific gap]. Happy to take it to DM if easier.</code>",
+            "<b>DM 2</b>",
+            f"<code>Looking at {name} properly (not just the chart). The product angle is interesting — mind if I ask a couple diligence questions in DM?</code>",
+            "<b>DM 3</b>",
+            f"<code>Went through {name} and the recent posts. Want to understand X before sizing anything. Open to a short DM?</code>",
+        ]
+    return "\n".join(header + body + ["", f"X: {esc(p.get('twitter') or '—')}"])
 
 
 def copyable_brief(text: str) -> str:
-    labels = {"CURIOUS", "INVESTOR", "SUGGESTION", "QUESTION", "SUPPORTER", "STRATEGIST", "RANDOM",
-              "OPTION1", "OPTION2", "OPTION3", "OPTION4", "OPTION5", "OPTION6",
-              "OPTION 1", "OPTION 2", "OPTION 3", "OPTION 4", "OPTION 5", "OPTION 6"}
+    """Format labeled reply options so each body is one long-press-copyable block."""
+    labels = {
+        "CURIOUS", "INVESTOR", "SUGGESTION", "QUESTION", "SUPPORTER", "STRATEGIST",
+        "RANDOM", "CASUAL", "ENGAGER", "DEGEN",
+        "OPTION1", "OPTION2", "OPTION3", "OPTION4", "OPTION5", "OPTION6",
+        "OPTION7", "OPTION8",
+        "OPTION 1", "OPTION 2", "OPTION 3", "OPTION 4", "OPTION 5", "OPTION 6",
+        "OPTION 7", "OPTION 8",
+    }
     out: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        nonlocal buf
+        if not buf:
+            return
+        body = "\n".join(buf).strip()
+        if body:
+            # <pre> = one tap/long-press copy on Telegram
+            out.append(f"<pre>{esc(body)}</pre>")
+        buf = []
+
     for raw in (text or "").splitlines():
         line = raw.strip()
         key = re.sub(r"[^A-Za-z0-9 ]", "", line).upper().strip()
-        if key in labels or key.startswith("OPTION"):
+        is_label = bool(key) and (key in labels or key.startswith("OPTION") or key in {
+            "CASUAL", "SUPPORTER", "QUESTION", "CURIOUS", "INVESTOR",
+            "ENGAGER", "STRATEGIST", "SUGGESTION",
+        })
+        if is_label:
+            flush()
             out.append(f"<b>{esc(line)}</b>")
         elif line:
-            out.append(f"<code>{esc(line)}</code>")
+            buf.append(line)
         else:
-            out.append("")
+            flush()
+    flush()
     return "\n".join(out)
 
 
@@ -2125,7 +2375,19 @@ async def claim_owner_if_needed(context: ContextTypes.DEFAULT_TYPE, user_id: int
     log.info("Owner locked to Telegram user %s", user_id)
 
 
-async def enrich_one(db: DB, client: httpx.AsyncClient, project: dict[str, Any], bot=None) -> dict[str, Any]:
+async def enrich_one(
+    db: DB,
+    client: httpx.AsyncClient,
+    project: dict[str, Any],
+    bot=None,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Fast path: skip heavy HTTP if enriched recently (speeds up buttons)."""
+    last = project.get("last_enriched_at") or 0
+    if not force and last and (now() - int(last)) < 600:  # 10 min cache
+        return project
+
     chain, addr = project["chain"], project["token_address"]
     data = await http_get(client, f"{DEX_API}/token-pairs/v1/{chain}/{addr}")
     pairs = data if isinstance(data, list) else []
@@ -2335,6 +2597,10 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         project = await enrich_one(db, client, project, context.bot)
         await safe_edit(q, report_text(project), report_keyboard(project))
+        if q.message:
+            remember_alert_message(
+                context.application, q.message.chat_id, q.message.message_id, project["id"]
+            )
     except Exception as exc:
         log.exception("cb_investigate failed")
         await safe_cb_answer(q, f"Error: {str(exc)[:80]}", show_alert=True)
@@ -2479,6 +2745,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Gemini: {esc(KEY_STATUS.get('gemini') or 'not tried')}\n"
         f"xAI: {esc(KEY_STATUS.get('xai') or 'not tried')} {'set' if env_secret('XAI_API_KEY') else 'NOT in env'}\n"
         f"X bearer: {esc(KEY_STATUS.get('x') or 'not tried')} {'set' if env_secret('X_BEARER_TOKEN','TWITTER_BEARER_TOKEN') else 'NOT in env'}\n"
+        f"Alchemy: {'set' if env_secret('ALCHEMY_API_KEY','ALCHEMY_KEY') else 'NOT in env'}\n"
         f"DB: {esc(str(db.path))}\n"
         f"Owner id: {owner[0] if owner else 'will lock on /start'}"
     )
@@ -2496,7 +2763,7 @@ async def ranked_window(db: DB, since_ts: int, min_score: int = 45) -> list[dict
 
 
 async def cmd_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show persona selector for a project."""
+    """Show Approach voice selector for a project."""
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
@@ -2508,15 +2775,15 @@ async def cmd_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text("Could not resolve id/CA. Try /project <CA> first.")
         return
     await update.effective_message.reply_html(
-        f"🎯 <b>Choose Approach / Persona</b>\n"
+        f"🎯 <b>APPROACH — choose a voice</b>\n"
         f"<b>{esc(title_of(project))}</b>\n\n"
-        "Pick the voice you want the generated messages written in:",
+        "Messages will be written fully in that character:",
         reply_markup=persona_select_keyboard(int(project["id"])),
     )
 
 
 async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate with default curious persona or show selector."""
+    """Classic Persona — multi-label reply-to-context style."""
     if not await gate(update, context) or not update.effective_message:
         return
     if not context.args:
@@ -2528,15 +2795,15 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.effective_message.reply_text("Could not resolve id/CA.")
         return
     project = await enrich_one(db, client, project, context.bot)
-    text = await persona_text(project, "curious")
+    text = await classic_persona_text(project)
     await update.effective_message.reply_html(
         text, disable_web_page_preview=True,
-        reply_markup=persona_select_keyboard(int(project["id"])),
+        reply_markup=report_keyboard(project),
     )
 
 
 async def cb_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show persona selector."""
+    """Show Approach voice selector (specific personas)."""
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
@@ -2552,14 +2819,14 @@ async def cb_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     await safe_edit(
         q,
-        f"🎯 <b>Choose Approach / Persona</b>\n<b>{esc(title_of(project))}</b>\n\n"
-        "Pick the voice for the generated messages:",
+        f"🎯 <b>APPROACH — choose a voice</b>\n<b>{esc(title_of(project))}</b>\n\n"
+        "Messages will be written fully in that character:",
         persona_select_keyboard(pid),
     )
 
 
 async def cb_persona_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate text in the selected persona."""
+    """Generate Approach text in the selected voice."""
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
@@ -2577,7 +2844,7 @@ async def cb_persona_select(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     try:
         project = await enrich_one(db, client, project, context.bot)
-        text = await persona_text(project, persona_key)
+        text = await approach_persona_text(project, persona_key)
         await safe_edit(q, text, persona_select_keyboard(pid))
     except Exception as exc:
         log.exception("cb_persona_select failed")
@@ -2585,11 +2852,11 @@ async def cb_persona_select(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def cb_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Legacy / quick persona (curious default)."""
+    """PERSONA button — classic multi-label reply-to-context style."""
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Building…")
+    await safe_cb_answer(q, "Writing…")
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
@@ -2601,10 +2868,34 @@ async def cb_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     try:
         project = await enrich_one(db, client, project, context.bot)
-        text = await persona_text(project, "curious")
-        await safe_edit(q, text, persona_select_keyboard(pid))
+        text = await classic_persona_text(project)
+        await safe_edit(q, text, report_keyboard(project))
     except Exception as exc:
         log.exception("cb_persona failed")
+        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
+
+
+async def cb_dm_opener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dedicated X DM / reply openers."""
+    if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
+        return
+    q = update.callback_query
+    await safe_cb_answer(q, "Writing DM openers…")
+    try:
+        pid = int(q.data.split(":")[1])
+    except Exception:
+        return
+    db, client = deps(context)
+    project = await db.by_id(pid)
+    if not project:
+        await safe_cb_answer(q, "Expired.", show_alert=True)
+        return
+    try:
+        project = await enrich_one(db, client, project, context.bot)
+        text = await dm_opener_text(project)
+        await safe_edit(q, text, report_keyboard(project))
+    except Exception as exc:
+        log.exception("cb_dm_opener failed")
         await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
 
 
@@ -2669,7 +2960,8 @@ async def cb_onchain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await safe_cb_answer(q, "Expired.", show_alert=True)
         return
     try:
-        project = await enrich_one(db, client, project, context.bot)
+        # Always force fresh on-chain pull when user asks
+        project = await enrich_one(db, client, project, context.bot, force=True)
         text = onchain_text(project)
         await safe_edit(q, text, report_keyboard(project))
     except Exception as exc:
@@ -2821,16 +3113,21 @@ async def discovery_once(app: Application) -> None:
                     "qualified": False,
                 })
 
-    all_gecko = [
-        ("solana", "solana"), ("eth", "ethereum"), ("base", "base"), ("bsc", "bsc"),
-        ("arbitrum", "arbitrum"), ("polygon_pos", "polygon"), ("sui-network", "sui"),
-        ("ton", "ton"), ("ink", "ink"), ("abstract", "abstract"), ("hyperevm", "hyperevm"),
-        ("cronos", "cronos"), ("optimism", "optimism"), ("avax", "avalanche"),
-        ("blast", "blast"), ("linea", "linea"), ("scroll", "scroll"), ("sonic", "sonic"),
-        ("monad", "monad"),
+    # Prioritize newer / thinner chains more often (Abstract, Ink, HyperEVM, Sui, TON, Monad)
+    priority_gecko = [
+        ("abstract", "abstract"), ("ink", "ink"), ("hyperevm", "hyperevm"),
+        ("sui-network", "sui"), ("ton", "ton"), ("monad", "monad"),
+        ("solana", "solana"), ("base", "base"),
     ]
-    start = (now() // 60) % max(1, len(all_gecko) - 3)
-    gecko_batch = all_gecko[start:start + 4]
+    other_gecko = [
+        ("eth", "ethereum"), ("bsc", "bsc"), ("arbitrum", "arbitrum"),
+        ("polygon_pos", "polygon"), ("cronos", "cronos"), ("optimism", "optimism"),
+        ("avax", "avalanche"), ("blast", "blast"), ("linea", "linea"),
+        ("scroll", "scroll"), ("sonic", "sonic"),
+    ]
+    # 3 priority + 2 rotating others per cycle
+    start = (now() // 60) % max(1, len(other_gecko))
+    gecko_batch = priority_gecko[:3] + other_gecko[start:start + 2]
     for network_id, _chain in gecko_batch:
         gecko = await http_get(
             client,
@@ -2842,7 +3139,65 @@ async def discovery_once(app: Application) -> None:
             for parsed in parse_gecko(gecko):
                 if parsed.get("chain") in DEFAULT_CHAINS:
                     await db.upsert(parsed)
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.3)
+
+    # Light CoinGecko trending (auto) — only items with socials + contract
+    # Runs every ~3rd cycle to avoid rate limits
+    if (now() // 90) % 3 == 0:
+        try:
+            resp = await client.get(
+                "https://api.coingecko.com/api/v3/search/trending",
+                timeout=15,
+                headers={"Accept": "application/json"},
+            )
+            if resp.status_code == 200:
+                for item in (resp.json().get("coins") or [])[:8]:
+                    c = item.get("item") or {}
+                    cid = c.get("id")
+                    if not cid:
+                        continue
+                    await asyncio.sleep(0.35)
+                    detail = await http_get(
+                        client,
+                        f"https://api.coingecko.com/api/v3/coins/{cid}",
+                        params={
+                            "localization": "false", "tickers": "false",
+                            "market_data": "false", "community_data": "true",
+                            "developer_data": "false",
+                        },
+                    )
+                    if not isinstance(detail, dict):
+                        continue
+                    links = detail.get("links") or {}
+                    homepage = next((u for u in (links.get("homepage") or []) if u), None)
+                    tw = links.get("twitter_screen_name") or ""
+                    tg = links.get("telegram_channel_identifier") or ""
+                    if not (homepage or tw or tg):
+                        continue
+                    platforms = detail.get("platforms") or {}
+                    chain, addr = None, None
+                    for plat, contract in platforms.items():
+                        if not contract:
+                            continue
+                        mapped = GECKO_CHAIN.get(plat.lower()) or CMC_CHAIN_MAP.get(plat.lower()) or plat.lower()
+                        if mapped in DEFAULT_CHAINS:
+                            chain, addr = mapped, contract
+                            break
+                    if not addr or not chain:
+                        continue
+                    await db.upsert({
+                        "chain": chain,
+                        "token_address": addr,
+                        "name": detail.get("name") or c.get("name"),
+                        "symbol": detail.get("symbol") or c.get("symbol"),
+                        "website": homepage,
+                        "twitter": f"https://x.com/{tw}" if tw else None,
+                        "telegram": f"https://t.me/{tg}" if tg else None,
+                        "source": "coingecko",
+                        "qualified": True,
+                    })
+        except Exception as exc:
+            log.warning("auto CG trending failed: %s", exc)
 
     rows = await db.unenriched(16)
     by_chain: dict[str, list[dict[str, Any]]] = {}
@@ -2875,6 +3230,22 @@ async def discovery_once(app: Application) -> None:
     await monitor_watches(app)
 
 
+
+def remember_alert_message(app: Application, chat_id: int, message_id: int, project_id: int) -> None:
+    """Map an alert/report Telegram message to a project so reply-to works without /ask."""
+    store = app.bot_data.setdefault("msg_projects", {})
+    store[(int(chat_id), int(message_id))] = int(project_id)
+    # Cap memory so Railway RAM stays light
+    if len(store) > 4000:
+        for k in list(store.keys())[:1000]:
+            store.pop(k, None)
+
+
+def lookup_alert_project(app: Application, chat_id: int, message_id: int) -> int | None:
+    store = app.bot_data.get("msg_projects") or {}
+    return store.get((int(chat_id), int(message_id)))
+
+
 async def send_alerts(app: Application) -> None:
     db: DB = app.bot_data["db"]
     owners: list[int] = app.bot_data.get("allowed") or []
@@ -2891,13 +3262,14 @@ async def send_alerts(app: Application) -> None:
             if not is_qualified(project):
                 continue
             try:
-                await app.bot.send_message(
+                sent = await app.bot.send_message(
                     chat_id=user_id,
                     text=alert_text(project),
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                     reply_markup=report_keyboard(project),
                 )
+                remember_alert_message(app, user_id, sent.message_id, project["id"])
                 await db.mark_alerted(user_id, project["id"])
             except Exception as exc:
                 log.warning("alert failed for %s: %s", user_id, exc)
@@ -2934,13 +3306,14 @@ async def send_social_alerts(app: Application) -> None:
             if not user.get("alerts_enabled", 1):
                 continue
             try:
-                await app.bot.send_message(
+                sent = await app.bot.send_message(
                     chat_id=user_id,
                     text=social_alert_text(project, kinds),
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                     reply_markup=report_keyboard(project),
                 )
+                remember_alert_message(app, user_id, sent.message_id, project["id"])
             except Exception as exc:
                 log.warning("social alert failed: %s", exc)
         for ev in evs:
@@ -3511,6 +3884,191 @@ async def cmd_cmc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True, reply_markup=markup)
 
 
+
+
+async def cb_reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """💬 Reply button on alert — wait for next text, then edit THIS message with options."""
+    if not update.callback_query or not update.callback_query.data:
+        return
+    if not await gate(update, context):
+        return
+    q = update.callback_query
+    if not update.effective_user or not q.message:
+        return
+    try:
+        pid = int(q.data.split(":")[1])
+    except Exception:
+        await safe_cb_answer(q, "Bad data", show_alert=True)
+        return
+    db, _ = deps(context)
+    project = await db.by_id(pid)
+    if not project:
+        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
+        return
+    pending = context.application.bot_data.setdefault("pending_reply", {})
+    pending[update.effective_user.id] = {
+        "pid": pid,
+        "chat_id": q.message.chat_id,
+        "message_id": q.message.message_id,
+    }
+    remember_alert_message(
+        context.application, q.message.chat_id, q.message.message_id, pid
+    )
+    await safe_cb_answer(q)
+    # Short prompt as a reply under the alert (user types next message)
+    try:
+        await q.message.reply_text(
+            f"💬 Reply mode for {title_of(project)[:40]}\n"
+            "Send the X post or text you want options for.\n"
+            "(Next message only — or tap 💬 Reply again to reset.)"
+        )
+    except Exception as exc:
+        log.warning("reply prompt failed: %s", exc)
+
+
+async def on_reply_to_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """After 💬 Reply button (or reply-to alert): generate copyable options on the alert page."""
+    if not await gate(update, context):
+        return
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not msg.text:
+        return
+    text_in = (msg.text or "").strip()
+    if not text_in or text_in.startswith("/"):
+        return
+
+    pending_map = context.application.bot_data.setdefault("pending_reply", {})
+    pending = pending_map.pop(user.id, None)
+
+    chat_id = msg.chat_id
+    pid: int | None = None
+    edit_chat_id: int | None = None
+    edit_message_id: int | None = None
+
+    if pending:
+        pid = int(pending["pid"])
+        edit_chat_id = int(pending["chat_id"])
+        edit_message_id = int(pending["message_id"])
+    elif msg.reply_to_message:
+        pid = lookup_alert_project(
+            context.application, chat_id, msg.reply_to_message.message_id
+        )
+        if pid is not None:
+            edit_chat_id = chat_id
+            edit_message_id = msg.reply_to_message.message_id
+    if pid is None:
+        return
+
+    db, client = deps(context)
+    project = await db.by_id(pid)
+    if not project:
+        await msg.reply_text("That project session expired. Open it again from an alert or /jobs.")
+        return
+
+    status = await msg.reply_text("✍️ Drafting replies on the alert…")
+    try:
+        project = await enrich_one(db, client, project, context.bot)
+        kind = classify_project(project)
+        kind_label = kind.get("label") if isinstance(kind, dict) else str(kind)
+        comm = community(project)
+        what = (
+            project.get("description")
+            or (comm.get("site_about") if isinstance(comm, dict) else None)
+            or "Thin public description."
+        )
+        prompt = (
+            f"Project: {title_of(project)}\n"
+            f"Chain: {project.get('chain')}\n"
+            f"Type: {kind_label}\n"
+            f"Website: {project.get('website')}\n"
+            f"X: {project.get('twitter')}\n"
+            f"Telegram: {project.get('telegram')}\n"
+            f"About: {what}\n\n"
+            f"USER PASTED THIS (X post / message / note). Write replies TO IT:\n"
+            f"{text_in[:1500]}\n\n"
+            f"Write EXACTLY these 8 reply options. Each body must be ready to copy-paste as-is.\n"
+            f"Different content each time — not the same idea reworded.\n"
+            f"No AI meta. No investment advice. Short human crypto replies.\n"
+            f"Rules per label:\n"
+            f"- CASUAL: relaxed natural reply\n"
+            f"- SUPPORTER: constructive support without sounding like a shill\n"
+            f"- QUESTION: address them first, then ask one clear question\n"
+            f"- CURIOUS: address them first, then a genuine curious question\n"
+            f"- INVESTOR: confident, thesis-minded, still human\n"
+            f"- ENGAGER: invites more conversation\n"
+            f"- STRATEGIST: sharp observation / growth angle\n"
+            f"- SUGGESTION: one concrete useful suggestion\n\n"
+            f"Format EXACTLY (labels on their own line):\n"
+            f"CASUAL\n<reply>\n\n"
+            f"SUPPORTER\n<reply>\n\n"
+            f"QUESTION\n<reply>\n\n"
+            f"CURIOUS\n<reply>\n\n"
+            f"INVESTOR\n<reply>\n\n"
+            f"ENGAGER\n<reply>\n\n"
+            f"STRATEGIST\n<reply>\n\n"
+            f"SUGGESTION\n<reply>\n"
+            f"Variation seed {random.randint(1, 9999)}."
+        )
+        generated = await llm_write(prompt)
+        # Keep a short project header + options on the SAME alert message
+        header = (
+            f"💬 <b>REPLY OPTIONS</b> · <b>{esc(title_of(project))}</b>\n"
+            f"<code>{esc(project.get('token_address') or '')}</code>\n\n"
+            f"<i>Re: {esc(text_in[:160])}{'…' if len(text_in) > 160 else ''}</i>\n"
+            f"<i>Long-press a block to copy</i>\n"
+        )
+        if generated:
+            body = copyable_brief(generated)
+            out = header + "\n" + body
+        else:
+            out = header + "\nAI unavailable — tap 💬 Reply and try again."
+
+        out = out[:4000]
+        kb = report_keyboard(project)
+        edited = False
+        if edit_chat_id is not None and edit_message_id is not None:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=edit_chat_id,
+                    message_id=edit_message_id,
+                    text=out,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=kb,
+                )
+                edited = True
+                remember_alert_message(
+                    context.application, edit_chat_id, edit_message_id, project["id"]
+                )
+            except Exception as exc:
+                log.warning("edit alert with replies failed: %s", exc)
+
+        if not edited:
+            sent = await msg.reply_html(
+                out, disable_web_page_preview=True, reply_markup=kb
+            )
+            remember_alert_message(
+                context.application, chat_id, sent.message_id, project["id"]
+            )
+        else:
+            try:
+                await msg.reply_text("✅ Options are on the alert message above.")
+            except Exception:
+                pass
+    except Exception:
+        log.exception("on_reply_to_alert failed")
+        try:
+            await msg.reply_text("Could not draft replies. Tap 💬 Reply and try again.")
+        except Exception:
+            pass
+    finally:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -3554,10 +4112,15 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_approach, pattern=r"^ap:"))
     app.add_handler(CallbackQueryHandler(cb_persona, pattern=r"^ps:"))
     app.add_handler(CallbackQueryHandler(cb_persona_select, pattern=r"^pn:"))
+    app.add_handler(CallbackQueryHandler(cb_dm_opener, pattern=r"^dm:"))
     app.add_handler(CallbackQueryHandler(cb_onchain, pattern=r"^oc:"))
     app.add_handler(CallbackQueryHandler(cb_gaps, pattern=r"^gp:"))
     app.add_handler(CallbackQueryHandler(cb_risks, pattern=r"^rk:"))
     app.add_handler(CallbackQueryHandler(cb_watch, pattern=r"^w:"))
+    app.add_handler(CallbackQueryHandler(cb_reply_prompt, pattern=r"^rp:"))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, on_reply_to_alert)
+    )
     log.info("Polling Telegram… build=%s", SCOUT_BUILD)
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
