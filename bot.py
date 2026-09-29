@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-29-scout-refresh-db-fix"
+SCOUT_BUILD = "2026-09-29-scout-ca-lock"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -2931,72 +2931,106 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 
-async def project_from_button(
-    q,
-    context: ContextTypes.DEFAULT_TYPE,
-    pid: int | None = None,
-) -> dict[str, Any] | None:
-    """Load project by id, or recover from the alert message text if DB was wiped/redeployed."""
-    db, client = deps(context)
-    if pid is not None:
-        row = await db.by_id(int(pid))
-        if row:
-            return row
-    # Recover from message body (survives id resets if same CA was re-scanned)
-    msg = q.message
-    blob = ""
-    if msg:
-        blob = (msg.text or "") + "\n" + (msg.caption or "")
+async def _extract_ca_chain_from_message(blob: str) -> tuple[str | None, str | None]:
+    """Pull contract + chain from a Scout alert/report message body."""
     if not blob:
-        return None
-    # Prefer explicit contract from Scout alerts/reports (HTML or plain text)
+        return None, None
     addr = None
+    # Only explicit contract lines / code tags — never loose base58 (false matches)
     for pat in (
         r"Contract:\s*`([^`]+)`",
         r"Contract:\s*([a-zA-Z0-9]{32,66})",
-        r"<code>([a-zA-Z0-9]{32,66})</code>",
+        r"Contract:\s*<code>([^<]+)</code>",
+        r"<code>(0x[a-fA-F0-9]{40})</code>",
+        r"<code>([1-9A-HJ-NP-Za-km-z]{32,48})</code>",
         r"\b(0x[a-fA-F0-9]{40})\b",
-        r"\b([1-9A-HJ-NP-Za-km-z]{32,48})\b",  # solana-ish
     ):
-        m = re.search(pat, blob)
+        m = re.search(pat, blob, flags=re.I)
         if m:
             cand = m.group(1).strip()
             if cand and cand not in {"—", "-", "none", "null"}:
                 addr = cand
                 break
-    if not addr:
-        return None
     chain = None
-    cm = re.search(r"NEW PROJECT IDENTIFIED \(([A-Za-z0-9_-]+)\)", blob)
-    if not cm:
-        cm = re.search(r"SOCIAL UPDATE \(([A-Za-z0-9_-]+)\)", blob)
-    if not cm:
-        cm = re.search(r"\(([A-Za-z0-9_-]+)\)\s*$", blob.splitlines()[0] if blob else "")
-    if cm:
-        chain = cm.group(1).lower()
-    # Try DB by token
-    if chain:
-        row = await db.by_token(chain, addr)
-        if row:
-            return row
-    # Any chain match on address
+    for pat in (
+        r"NEW PROJECT IDENTIFIED \(([A-Za-z0-9_-]+)\)",
+        r"SOCIAL UPDATE \(([A-Za-z0-9_-]+)\)",
+        r"🚨[^\n]*\(([A-Za-z0-9_-]+)\)",
+    ):
+        cm = re.search(pat, blob, flags=re.I)
+        if cm:
+            chain = cm.group(1).lower()
+            break
+    return addr, chain
+
+
+async def project_from_button(
+    q,
+    context: ContextTypes.DEFAULT_TYPE,
+    pid: int | None = None,
+) -> dict[str, Any] | None:
+    """Load the project for a button press.
+
+    CRITICAL: After DB wipe/redeploy, numeric ids get reused for different CAs.
+    Always prefer the contract shown on the message over a recycled id.
+    """
+    db, client = deps(context)
+    msg = q.message
+    blob = ""
+    if msg:
+        blob = (msg.text or "") + "\n" + (msg.caption or "")
+    msg_addr, msg_chain = _extract_ca_chain_from_message(blob)
+
+    row = None
+    if pid is not None:
+        try:
+            row = await db.by_id(int(pid))
+        except Exception:
+            row = None
+
+    # If message has a CA and by_id row disagrees → message wins (recycled id case)
+    if row and msg_addr:
+        row_addr = (row.get("token_address") or "").strip()
+        if row_addr and row_addr.lower() != msg_addr.lower():
+            log.warning(
+                "button id=%s points to %s but message CA is %s — using message CA",
+                pid, row_addr, msg_addr,
+            )
+            row = None
+        elif msg_chain and (row.get("chain") or "").lower() not in {msg_chain, msg_chain.replace("_", "")}:
+            # soft: chain labels sometimes differ (base vs base-mainnet) — only drop on clear CA mismatch
+            pass
+
+    if row:
+        return row
+
+    # Recover by contract on the message
+    if not msg_addr:
+        return None
+
+    if msg_chain:
+        found = await db.by_token(msg_chain, msg_addr)
+        if found:
+            return found
+
     try:
         cur = await db.c.execute(
             "SELECT * FROM projects WHERE lower(token_address)=lower(?) ORDER BY id DESC LIMIT 1",
-            (addr,),
+            (msg_addr,),
         )
-        row = await cur.fetchone()
-        if row:
-            return dict(row)
+        found = await cur.fetchone()
+        if found:
+            return dict(found)
     except Exception:
         log.warning("address fallback query failed", exc_info=True)
-    # Live resolve from Dex
-    query = f"{chain}:{addr}" if chain else addr
-    try:
-        return await resolve_project(db, client, query, context.bot)
-    except Exception:
-        log.exception("resolve_project fallback failed")
-        return None
+
+    # Live resolve ONLY with explicit chain:addr (never bare search — that swaps projects)
+    if msg_chain:
+        try:
+            return await resolve_project(db, client, f"{msg_chain}:{msg_addr}", context.bot)
+        except Exception:
+            log.exception("resolve_project fallback failed")
+    return None
 
 
 async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
