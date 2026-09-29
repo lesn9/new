@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-29-scout-grounded-personas"
+SCOUT_BUILD = "2026-09-29-scout-buttons-fix"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -1152,12 +1152,10 @@ async def llm_write(prompt: str) -> str | None:
         models = [
             (os.getenv("GROQ_MODEL") or "").strip(),
             "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
             "openai/gpt-oss-120b",
-            "qwen/qwen3-32b",
         ]
         try:
-            async with httpx.AsyncClient(timeout=45) as client:
+            async with httpx.AsyncClient(timeout=16) as client:
                 for model in models:
                     if not model:
                         continue
@@ -1192,14 +1190,11 @@ async def llm_write(prompt: str) -> str | None:
         KEY_STATUS["openrouter"] = "present"
         models = [
             (os.getenv("OPENROUTER_MODEL") or "").strip(),
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "qwen/qwen3-235b-a22b:free",
-            "deepseek/deepseek-chat-v3.1:free",
-            "google/gemini-2.0-flash-exp:free",
             "openrouter/auto",
+            "meta-llama/llama-3.3-70b-instruct:free",
         ]
         try:
-            async with httpx.AsyncClient(timeout=45) as client:
+            async with httpx.AsyncClient(timeout=16) as client:
                 for model in models:
                     if not model:
                         continue
@@ -1245,7 +1240,7 @@ async def llm_write(prompt: str) -> str | None:
         ]
         seen: set[str] = set()
         try:
-            async with httpx.AsyncClient(timeout=45) as client:
+            async with httpx.AsyncClient(timeout=16) as client:
                 for model in models:
                     if not model or model in seen:
                         continue
@@ -1283,7 +1278,7 @@ async def llm_write(prompt: str) -> str | None:
     if not providers:
         return None
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
+        async with httpx.AsyncClient(timeout=16) as client:
             for kind, key, model in providers:
                 url = "https://api.x.ai/v1/chat/completions" if kind == "xai" else "https://api.openai.com/v1/chat/completions"
                 resp = await client.post(
@@ -2423,6 +2418,8 @@ async def safe_cb_answer(query, text: str | None = None, show_alert: bool = Fals
 
 
 async def safe_edit(query, text: str, reply_markup=None) -> None:
+    """Edit the button message. Fall back to plain text / new reply if HTML fails."""
+    text = (text or "")[:4090]
     try:
         await query.edit_message_text(
             text,
@@ -2430,18 +2427,58 @@ async def safe_edit(query, text: str, reply_markup=None) -> None:
             disable_web_page_preview=True,
             reply_markup=reply_markup,
         )
+        return
     except Exception as exc:
         err = str(exc).lower()
         if "not modified" in err:
-            await safe_cb_answer(query, "Already up to date")
+            try:
+                await query.answer("Already up to date")
+            except Exception:
+                pass
             return
-        log.warning("edit_message failed: %s", exc)
-        try:
+        log.warning("edit_message HTML failed: %s", exc)
+    # Strip tags and retry plain (broken AI HTML is a common failure mode)
+    plain = re.sub(r"<[^>]+>", "", text)
+    plain = (
+        plain.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+    )
+    plain = plain[:4090]
+    try:
+        await query.edit_message_text(
+            plain or "Done.",
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+        return
+    except Exception as exc2:
+        log.warning("edit_message plain failed: %s", exc2)
+    # Last resort: new message in chat
+    try:
+        if query.message:
             await query.message.reply_html(
-                text, disable_web_page_preview=True, reply_markup=reply_markup
+                text[:4090], disable_web_page_preview=True, reply_markup=reply_markup
             )
-        except Exception as exc2:
-            log.warning("reply fallback failed: %s", exc2)
+    except Exception:
+        try:
+            if query.message:
+                await query.message.reply_text(plain[:4090] or "Done.", reply_markup=reply_markup)
+        except Exception as exc3:
+            log.warning("reply fallback failed: %s", exc3)
+
+
+
+async def safe_fail(query, msg: str, reply_markup=None) -> None:
+    """Show an error on the message (callback may already be answered)."""
+    try:
+        await safe_edit(query, f"⚠️ {esc(msg)}", reply_markup=reply_markup)
+    except Exception:
+        try:
+            await query.answer(msg[:180], show_alert=True)
+        except Exception:
+            pass
 
 
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2492,7 +2529,7 @@ async def enrich_one(
 ) -> dict[str, Any]:
     """Fast path: skip heavy HTTP if enriched recently (speeds up buttons)."""
     last = project.get("last_enriched_at") or 0
-    if not force and last and (now() - int(last)) < 600:  # 10 min cache
+    if not force and last and (now() - int(last)) < 1800:  # 30 min cache
         return project
 
     chain, addr = project["chain"], project["token_address"]
@@ -2508,13 +2545,28 @@ async def enrich_one(
     else:
         await db.mark_enriched(project["id"])
     fresh = await db.by_id(project["id"]) or project
-    try:
-        payload = await enrich_community(bot, client, fresh)
-        if payload:
-            await db.save_community(fresh["id"], payload)
-            fresh = await db.by_id(fresh["id"]) or fresh
-    except Exception:
-        log.exception("community enrich failed for %s", fresh.get("id"))
+
+    # Community scrape is slow — skip if we already have useful text unless force
+    comm = community(fresh)
+    need_community = force or not (
+        (fresh.get("description") or "").strip()
+        or comm.get("site_about")
+        or comm.get("x_tweets")
+        or comm.get("tg_about")
+    )
+    if need_community:
+        try:
+            payload = await asyncio.wait_for(
+                enrich_community(bot, client, fresh),
+                timeout=12.0,
+            )
+            if payload:
+                await db.save_community(fresh["id"], payload)
+                fresh = await db.by_id(fresh["id"]) or fresh
+        except asyncio.TimeoutError:
+            log.warning("community enrich timed out for %s", fresh.get("id"))
+        except Exception:
+            log.exception("community enrich failed for %s", fresh.get("id"))
     return fresh
 
 
@@ -2690,7 +2742,7 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await gate(update, context):
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Researching…")
+    await safe_cb_answer(q, "Refreshing…")
     try:
         pid = int(q.data.split(":")[1])
     except (IndexError, ValueError):
@@ -2701,8 +2753,18 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not project:
         await safe_cb_answer(q, "Expired — send /jobs again", show_alert=True)
         return
+    # Instant UI feedback so Telegram spinner stops and user sees progress
     try:
-        project = await enrich_one(db, client, project, context.bot)
+        await q.edit_message_text(
+            f"⏳ Refreshing <b>{esc(title_of(project))}</b>…",
+            parse_mode="HTML",
+            reply_markup=report_keyboard(project),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+    try:
+        project = await enrich_one(db, client, project, context.bot, force=True)
         await safe_edit(q, report_text(project), report_keyboard(project))
         if q.message:
             remember_alert_message(
@@ -2710,7 +2772,10 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
     except Exception as exc:
         log.exception("cb_investigate failed")
-        await safe_cb_answer(q, f"Error: {str(exc)[:80]}", show_alert=True)
+        try:
+            await safe_edit(q, f"⚠️ Refresh failed: {esc(str(exc)[:120])}\nTap 🔄 Refresh to retry.", report_keyboard(project))
+        except Exception:
+            pass
 
 
 async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2950,12 +3015,11 @@ async def cb_persona_select(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await safe_cb_answer(q, "Expired. Open /jobs again.", show_alert=True)
         return
     try:
-        project = await enrich_one(db, client, project, context.bot)
         text = await approach_persona_text(project, persona_key)
         await safe_edit(q, text, persona_select_keyboard(pid))
     except Exception as exc:
         log.exception("cb_persona_select failed")
-        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
+        await safe_fail(q, f"Approach voice failed: {str(exc)[:80]}")
 
 
 async def cb_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2963,23 +3027,26 @@ async def cb_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Writing…")
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
+        await safe_cb_answer(q, "Bad button", show_alert=True)
         return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "Expired.", show_alert=True)
+        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
         return
+    await safe_cb_answer(q, "Writing…")
     try:
-        project = await enrich_one(db, client, project, context.bot)
+        # Use stored project — skip slow re-enrich so button responds fast
         text = await classic_persona_text(project)
         await safe_edit(q, text, report_keyboard(project))
+        if q.message:
+            remember_alert_message(context.application, q.message.chat_id, q.message.message_id, project["id"])
     except Exception as exc:
         log.exception("cb_persona failed")
-        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
+        await safe_fail(q, f"Persona failed: {str(exc)[:80]}", report_keyboard(project) if project else None)
 
 
 async def cb_dm_opener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2987,85 +3054,88 @@ async def cb_dm_opener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Writing DM openers…")
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
+        await safe_cb_answer(q, "Bad button", show_alert=True)
         return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "Expired.", show_alert=True)
+        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
         return
+    await safe_cb_answer(q, "Writing DM openers…")
     try:
-        project = await enrich_one(db, client, project, context.bot)
         text = await dm_opener_text(project)
         await safe_edit(q, text, report_keyboard(project))
+        if q.message:
+            remember_alert_message(context.application, q.message.chat_id, q.message.message_id, project["id"])
     except Exception as exc:
         log.exception("cb_dm_opener failed")
-        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
+        await safe_fail(q, f"DM openers failed: {str(exc)[:80]}", report_keyboard(project) if project else None)
 
 
 async def cb_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Researching gaps…")
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
+        await safe_cb_answer(q, "Bad button", show_alert=True)
         return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "Expired.", show_alert=True)
+        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
         return
+    await safe_cb_answer(q, "Researching gaps…")
     try:
-        project = await enrich_one(db, client, project, context.bot)
         text = await gaps_text(project)
         await safe_edit(q, text, report_keyboard(project))
     except Exception as exc:
         log.exception("cb_gaps failed")
-        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
+        await safe_fail(q, f"Gaps failed: {str(exc)[:80]}", report_keyboard(project) if project else None)
 
 
 async def cb_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Researching risks…")
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
+        await safe_cb_answer(q, "Bad button", show_alert=True)
         return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "Expired.", show_alert=True)
+        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
         return
+    await safe_cb_answer(q, "Researching risks…")
     try:
-        project = await enrich_one(db, client, project, context.bot)
         text = await risks_text(project)
         await safe_edit(q, text, report_keyboard(project))
     except Exception as exc:
         log.exception("cb_risks failed")
-        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
+        await safe_fail(q, f"Risks failed: {str(exc)[:80]}", report_keyboard(project) if project else None)
 
 
 async def cb_onchain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    await safe_cb_answer(q, "On-chain…")
     try:
         pid = int(q.data.split(":")[1])
     except Exception:
+        await safe_cb_answer(q, "Bad button", show_alert=True)
         return
     db, client = deps(context)
     project = await db.by_id(pid)
     if not project:
-        await safe_cb_answer(q, "Expired.", show_alert=True)
+        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
         return
+    await safe_cb_answer(q, "On-chain…")
     try:
         # Always force fresh on-chain pull when user asks
         project = await enrich_one(db, client, project, context.bot, force=True)
@@ -3073,7 +3143,7 @@ async def cb_onchain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await safe_edit(q, text, report_keyboard(project))
     except Exception as exc:
         log.exception("cb_onchain failed")
-        await safe_cb_answer(q, f"Error: {str(exc)[:60]}", show_alert=True)
+        await safe_fail(q, f"On-chain failed: {str(exc)[:80]}", report_keyboard(project) if project else None)
 
 
 async def cmd_early(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4226,6 +4296,20 @@ def main() -> None:
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, on_reply_to_alert)
     )
+    async def _err(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        log.exception("handler error: %s", context.error)
+        try:
+            q = getattr(update, "callback_query", None) if update else None
+            if q:
+                try:
+                    await q.answer("Something went wrong — try again", show_alert=True)
+                except Exception:
+                    if q.message:
+                        await q.message.reply_text("Something went wrong — try the button again.")
+        except Exception:
+            pass
+
+    app.add_error_handler(_err)
     log.info("Polling Telegram… build=%s", SCOUT_BUILD)
     app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
