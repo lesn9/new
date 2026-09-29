@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-29-scout-buttons-stable"
+SCOUT_BUILD = "2026-09-29-scout-durable-cb"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -1869,7 +1869,7 @@ def list_item(index: int, p: dict[str, Any]) -> str:
 
 def list_keyboard(projects: list[dict[str, Any]], since_ts: int, offset: int, total: int) -> InlineKeyboardMarkup:
     page = 5
-    rows = [[InlineKeyboardButton(f"🔍 {title_of(p)[:28]}", callback_data=f"inv:{p['id']}")] for p in projects]
+    rows = [[InlineKeyboardButton(f"🔍 {title_of(p)[:28]}", callback_data=cb_data("inv", p))] for p in projects]
     nav: list[InlineKeyboardButton] = []
     if offset > 0:
         nav.append(InlineKeyboardButton("← Back", callback_data=f"nt:{since_ts}:{max(offset - page, 0)}"))
@@ -1937,27 +1937,97 @@ def report_text(p: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
+def cb_data(prefix: str, p: dict[str, Any]) -> str:
+    """Durable callback_data: prefix:chain:addr (max 64 bytes). Survives DB id resets."""
+    chain = re.sub(r"[^a-z0-9]", "", (p.get("chain") or "").lower())[:16]
+    addr = (p.get("token_address") or "").strip()
+    if chain and addr:
+        data = f"{prefix}:{chain}:{addr}"
+        if len(data.encode("utf-8")) <= 64:
+            return data
+    return f"{prefix}:{p['id']}"
+
+
+def cb_data_persona(p: dict[str, Any], persona_key: str) -> str:
+    chain = re.sub(r"[^a-z0-9]", "", (p.get("chain") or "").lower())[:12]
+    addr = (p.get("token_address") or "").strip()
+    key = re.sub(r"[^a-z0-9_]", "", (persona_key or "curious").lower())[:16]
+    if chain and addr:
+        data = f"pn:{chain}:{addr}:{key}"
+        if len(data.encode("utf-8")) <= 64:
+            return data
+    return f"pn:{p['id']}:{key}"
+
+
+async def resolve_from_cb_parts(
+    context: ContextTypes.DEFAULT_TYPE,
+    q,
+    parts: list[str],
+) -> dict[str, Any] | None:
+    """Parse inv:id | inv:chain:addr → project row."""
+    try:
+        db, client = deps(context)
+    except Exception:
+        log.exception("resolve_from_cb_parts: deps")
+        return None
+    if not parts:
+        return None
+    rest = parts[1:]
+    if not rest:
+        return None
+
+    # chain:addr (chain not a pure number)
+    if len(rest) >= 2 and not rest[0].isdigit():
+        chain, addr = rest[0].lower(), rest[1]
+        try:
+            found = await db.by_token(chain, addr)
+            if found:
+                return found
+            cur = await db.c.execute(
+                "SELECT * FROM projects WHERE lower(token_address)=lower(?) ORDER BY id DESC LIMIT 1",
+                (addr,),
+            )
+            row = await cur.fetchone()
+            if row:
+                return dict(row)
+            return await resolve_project(db, client, f"{chain}:{addr}", context.bot)
+        except Exception:
+            log.exception("resolve_from_cb_parts chain:addr")
+            return None
+
+    if rest[0].isdigit():
+        try:
+            row = await db.by_id(int(rest[0]))
+            if row:
+                return row
+        except Exception:
+            log.exception("resolve_from_cb_parts by_id")
+        return await project_from_button(q, context, int(rest[0]))
+
+    return None
+
+
 def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
-    pid = p["id"]
     rows: list[list[InlineKeyboardButton]] = [
         [
-            InlineKeyboardButton("⭐ Watch", callback_data=f"w:{pid}"),
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"inv:{pid}"),
+            InlineKeyboardButton("⭐ Watch", callback_data=cb_data("w", p)),
+            InlineKeyboardButton("🔄 Refresh", callback_data=cb_data("inv", p)),
         ],
         [
-            InlineKeyboardButton("🎭 Persona", callback_data=f"ps:{pid}"),
-            InlineKeyboardButton("💬 Reply", callback_data=f"rp:{pid}"),
+            InlineKeyboardButton("🎭 Persona", callback_data=cb_data("ps", p)),
+            InlineKeyboardButton("💬 Reply", callback_data=cb_data("rp", p)),
         ],
         [
-            InlineKeyboardButton("📩 DM Opener", callback_data=f"dm:{pid}"),
-            InlineKeyboardButton("🐦 X Comment", callback_data=f"xc:{pid}"),
+            InlineKeyboardButton("📩 DM Opener", callback_data=cb_data("dm", p)),
+            InlineKeyboardButton("🐦 X Comment", callback_data=cb_data("xc", p)),
         ],
         [
-            InlineKeyboardButton("⛓ On-chain", callback_data=f"oc:{pid}"),
-            InlineKeyboardButton("🔍 Gaps", callback_data=f"gp:{pid}"),
+            InlineKeyboardButton("⛓ On-chain", callback_data=cb_data("oc", p)),
+            InlineKeyboardButton("🔍 Gaps", callback_data=cb_data("gp", p)),
         ],
         [
-            InlineKeyboardButton("⚠️ Risks", callback_data=f"rk:{pid}"),
+            InlineKeyboardButton("⚠️ Risks", callback_data=cb_data("rk", p)),
         ],
     ]
     links: list[InlineKeyboardButton] = []
@@ -1980,29 +2050,39 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def persona_select_keyboard(pid: int) -> InlineKeyboardMarkup:
+def persona_select_keyboard(p: dict[str, Any] | int) -> InlineKeyboardMarkup:
     """Approach selector — pick a specific voice."""
+    # Accept project dict (preferred) or bare id for backward compatibility
+    if isinstance(p, int):
+        pid = p
+        inv = f"inv:{pid}"
+        def pn(key: str) -> str:
+            return f"pn:{pid}:{key}"
+    else:
+        inv = cb_data("inv", p)
+        def pn(key: str) -> str:
+            return cb_data_persona(p, key)
     rows = [
         [
-            InlineKeyboardButton("💰 Investor", callback_data=f"pn:{pid}:investor"),
-            InlineKeyboardButton("👀 Curious", callback_data=f"pn:{pid}:curious"),
+            InlineKeyboardButton("💰 Investor", callback_data=pn("investor")),
+            InlineKeyboardButton("👀 Curious", callback_data=pn("curious")),
         ],
         [
-            InlineKeyboardButton("❓ Question", callback_data=f"pn:{pid}:question"),
-            InlineKeyboardButton("🚀 Bullish", callback_data=f"pn:{pid}:bullish"),
+            InlineKeyboardButton("❓ Question", callback_data=pn("question")),
+            InlineKeyboardButton("🚀 Bullish", callback_data=pn("bullish")),
         ],
         [
-            InlineKeyboardButton("💎 Holder", callback_data=f"pn:{pid}:holder"),
-            InlineKeyboardButton("🧠 Strategist", callback_data=f"pn:{pid}:strategist"),
+            InlineKeyboardButton("💎 Holder", callback_data=pn("holder")),
+            InlineKeyboardButton("🧠 Strategist", callback_data=pn("strategist")),
         ],
         [
-            InlineKeyboardButton("🙌 Supporter", callback_data=f"pn:{pid}:supporter"),
-            InlineKeyboardButton("🎲 Random", callback_data=f"pn:{pid}:random"),
+            InlineKeyboardButton("🙌 Supporter", callback_data=pn("supporter")),
+            InlineKeyboardButton("🎲 Random", callback_data=pn("random")),
         ],
         [
-            InlineKeyboardButton("🐸 Degen", callback_data=f"pn:{pid}:degen"),
+            InlineKeyboardButton("🐸 Degen", callback_data=pn("degen")),
         ],
-        [InlineKeyboardButton("« Back to report", callback_data=f"inv:{pid}")],
+        [InlineKeyboardButton("« Back to report", callback_data=inv)],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -3025,16 +3105,15 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await gate(update, context):
         return
     q = update.callback_query
-    try:
-        pid = int(q.data.split(":")[1])
-    except (IndexError, ValueError):
-        await safe_cb_answer(q, "Bad button data", show_alert=True)
-        return
-    project = await project_from_button(q, context, pid)
+    parts = (q.data or "").split(":")
+    project = await resolve_from_cb_parts(context, q, parts)
+    if not project:
+        # last chance: message text recovery
+        project = await project_from_button(q, context, None)
     if not project:
         await safe_cb_answer(
             q,
-            "Project not in DB. Use /project <CA> or wait for a new alert.",
+            "Can't resolve this alert. Send /project <contract address>",
             show_alert=True,
         )
         return
@@ -3071,12 +3150,14 @@ async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context):
         return
     try:
-        pid = int(update.callback_query.data.split(":")[1])
-        project = await project_from_button(update.callback_query, context, pid)
+        parts = (update.callback_query.data or "").split(":")
+        project = await resolve_from_cb_parts(context, update.callback_query, parts)
+        if not project:
+            project = await project_from_button(update.callback_query, context, None)
         if not project:
             await safe_cb_answer(
                 update.callback_query,
-                "Project not in DB (old alert after redeploy). Use /project <CA> then /watch.",
+                "Can't resolve. /project <CA> then watch from the new report.",
                 show_alert=True,
             )
             return
@@ -3245,7 +3326,7 @@ async def cmd_approach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"🎯 <b>APPROACH — choose a voice</b>\n"
         f"<b>{esc(title_of(project))}</b>\n\n"
         "Messages will be written fully in that character:",
-        reply_markup=persona_select_keyboard(int(project["id"])),
+        reply_markup=persona_select_keyboard(project),
     )
 
 
@@ -3297,21 +3378,25 @@ async def cb_persona_select(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
+    parts = (q.data or "").split(":")
+    persona_key = "curious"
+    if len(parts) >= 4 and not parts[1].isdigit():
+        persona_key = parts[3]
+        project = await resolve_from_cb_parts(context, q, parts[:3])
+    elif len(parts) >= 3 and parts[1].isdigit():
+        persona_key = parts[2]
+        project = await resolve_from_cb_parts(context, q, parts[:2])
+    else:
+        project = await resolve_from_cb_parts(context, q, parts)
+    if not project:
+        project = await project_from_button(q, context, None)
+    if not project:
+        await safe_cb_answer(q, "Can't resolve. /project <CA>", show_alert=True)
+        return
     await safe_cb_answer(q, "Writing…")
     try:
-        parts = q.data.split(":")
-        pid = int(parts[1])
-        persona_key = parts[2] if len(parts) > 2 else "curious"
-    except Exception:
-        return
-    db, client = deps(context)
-    project = await db.by_id(pid)
-    if not project:
-        await safe_cb_answer(q, "Expired. Open /jobs again.", show_alert=True)
-        return
-    try:
         text = await approach_persona_text(project, persona_key)
-        await safe_edit(q, text, persona_select_keyboard(pid))
+        await safe_edit(q, text, persona_select_keyboard(project))
     except Exception as exc:
         log.exception("cb_persona_select failed")
         await safe_fail(q, f"Approach voice failed: {str(exc)[:80]}")
@@ -3322,16 +3407,14 @@ async def cb_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    try:
-        pid = int(q.data.split(":")[1])
-    except Exception:
-        await safe_cb_answer(q, "Bad button", show_alert=True)
-        return
-    project = await project_from_button(q, context, pid)
+    parts = (q.data or "").split(":")
+    project = await resolve_from_cb_parts(context, q, parts)
+    if not project:
+        project = await project_from_button(q, context, None)
     if not project:
         await safe_cb_answer(
             q,
-            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            "Can't resolve this alert. Send /project <contract address>",
             show_alert=True,
         )
         return
@@ -3352,16 +3435,14 @@ async def cb_dm_opener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    try:
-        pid = int(q.data.split(":")[1])
-    except Exception:
-        await safe_cb_answer(q, "Bad button", show_alert=True)
-        return
-    project = await project_from_button(q, context, pid)
+    parts = (q.data or "").split(":")
+    project = await resolve_from_cb_parts(context, q, parts)
+    if not project:
+        project = await project_from_button(q, context, None)
     if not project:
         await safe_cb_answer(
             q,
-            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            "Can't resolve this alert. Send /project <contract address>",
             show_alert=True,
         )
         return
@@ -3383,16 +3464,14 @@ async def cb_x_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    try:
-        pid = int(q.data.split(":")[1])
-    except Exception:
-        await safe_cb_answer(q, "Bad button", show_alert=True)
-        return
-    project = await project_from_button(q, context, pid)
+    parts = (q.data or "").split(":")
+    project = await resolve_from_cb_parts(context, q, parts)
+    if not project:
+        project = await project_from_button(q, context, None)
     if not project:
         await safe_cb_answer(
             q,
-            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            "Can't resolve this alert. Send /project <contract address>",
             show_alert=True,
         )
         return
@@ -3416,16 +3495,14 @@ async def cb_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    try:
-        pid = int(q.data.split(":")[1])
-    except Exception:
-        await safe_cb_answer(q, "Bad button", show_alert=True)
-        return
-    project = await project_from_button(q, context, pid)
+    parts = (q.data or "").split(":")
+    project = await resolve_from_cb_parts(context, q, parts)
+    if not project:
+        project = await project_from_button(q, context, None)
     if not project:
         await safe_cb_answer(
             q,
-            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            "Can't resolve this alert. Send /project <contract address>",
             show_alert=True,
         )
         return
@@ -3442,16 +3519,14 @@ async def cb_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    try:
-        pid = int(q.data.split(":")[1])
-    except Exception:
-        await safe_cb_answer(q, "Bad button", show_alert=True)
-        return
-    project = await project_from_button(q, context, pid)
+    parts = (q.data or "").split(":")
+    project = await resolve_from_cb_parts(context, q, parts)
+    if not project:
+        project = await project_from_button(q, context, None)
     if not project:
         await safe_cb_answer(
             q,
-            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            "Can't resolve this alert. Send /project <contract address>",
             show_alert=True,
         )
         return
@@ -3468,16 +3543,14 @@ async def cb_onchain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
     q = update.callback_query
-    try:
-        pid = int(q.data.split(":")[1])
-    except Exception:
-        await safe_cb_answer(q, "Bad button", show_alert=True)
-        return
-    project = await project_from_button(q, context, pid)
+    parts = (q.data or "").split(":")
+    project = await resolve_from_cb_parts(context, q, parts)
+    if not project:
+        project = await project_from_button(q, context, None)
     if not project:
         await safe_cb_answer(
             q,
-            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            "Can't resolve this alert. Send /project <contract address>",
             show_alert=True,
         )
         return
