@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-29-scout-buttons-fix"
+SCOUT_BUILD = "2026-09-29-scout-x-no-bearer"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -328,7 +328,7 @@ def pick_db_path() -> str:
             os.makedirs(folder, exist_ok=True)
             return requested
         except OSError:
-            log.warning("Cannot create %s — using ./scout.db", folder)
+            log.warning("Cannot create %s — using ./scout.db (set DATABASE_PATH to a Railway volume or data is wiped on redeploy)", folder)
             return "./scout.db"
     return requested
 
@@ -1054,37 +1054,135 @@ async def fetch_telegram(bot, url: str) -> dict[str, Any]:
         return {}
 
 
-async def fetch_x_tweets(client: httpx.AsyncClient, handle: str) -> list[dict[str, Any]]:
-    token = env_secret("X_BEARER_TOKEN", "TWITTER_BEARER_TOKEN")
-    if not token or not handle:
+async def fetch_x_tweets_public(client: httpx.AsyncClient, handle: str) -> list[dict[str, Any]]:
+    """Best-effort recent posts without X Bearer (public mirrors / readers)."""
+    handle = (handle or "").lstrip("@").strip()
+    if not handle:
         return []
-    headers = {"Authorization": f"Bearer {token}"}
+    out: list[dict[str, Any]] = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; Web3ProjectScout/1.0)",
+        "Accept": "text/plain,text/html,application/json",
+    }
+    # 1) Jina reader — readable text of the profile (no API key)
     try:
-        user = await client.get(
-            f"https://api.x.com/2/users/by/username/{handle}",
-            headers=headers,
-            timeout=15,
+        resp = await client.get(
+            f"https://r.jina.ai/https://x.com/{handle}",
+            headers={**headers, "Accept": "text/plain"},
+            timeout=18,
+            follow_redirects=True,
         )
-        if user.status_code >= 400:
-            return []
-        uid = (user.json().get("data") or {}).get("id")
-        if not uid:
-            return []
-        tw = await client.get(
-            f"https://api.x.com/2/users/{uid}/tweets",
-            headers=headers,
-            params={"max_results": 5, "tweet.fields": "created_at,text"},
-            timeout=15,
-        )
-        if tw.status_code >= 400:
-            return []
-        return [
-            {"id": t.get("id"), "text": t.get("text"), "created_at": t.get("created_at")}
-            for t in (tw.json().get("data") or [])
-        ]
+        if resp.status_code < 400 and resp.text:
+            text = resp.text
+            # Prefer lines that look like post body near status URLs
+            status_ids = re.findall(
+                rf"https?://(?:x|twitter)\.com/{re.escape(handle)}/status/(\d+)",
+                text,
+                flags=re.I,
+            )
+            # Split on double newlines; pick substantial non-nav chunks
+            chunks = [c.strip() for c in re.split(r"\n{2,}", text) if c and len(c.strip()) > 40]
+            skip_kw = (
+                "sign in", "sign up", "javascript", "cookie", "privacy",
+                "trending", "what is happening", "home", "explore",
+            )
+            for chunk in chunks:
+                low = chunk.lower()
+                if any(k in low for k in skip_kw):
+                    continue
+                # Drop pure URL-only / metadata lines
+                body = re.sub(r"https?://\S+", "", chunk).strip()
+                body = re.sub(r"\s+", " ", body)
+                if len(body) < 30 or len(body) > 400:
+                    continue
+                if body.startswith("@") and " " not in body[1:20]:
+                    continue
+                tid = status_ids[len(out)] if len(out) < len(status_ids) else None
+                out.append({"id": tid, "text": body[:480], "created_at": None, "source": "public"})
+                if len(out) >= 3:
+                    break
     except Exception as exc:
-        log.warning("X tweets failed @%s: %s", handle, exc)
+        log.warning("public X reader failed @%s: %s", handle, exc)
+
+    # 2) Syndication timeline (sometimes available without auth)
+    if len(out) < 2:
+        try:
+            resp = await client.get(
+                f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{handle}",
+                headers=headers,
+                timeout=15,
+                follow_redirects=True,
+            )
+            if resp.status_code < 400 and resp.text:
+                # Extract tweet text-ish from HTML data attributes / JSON islands
+                for m in re.finditer(
+                    r'"text":"((?:\\.|[^"\\]){20,400})"',
+                    resp.text,
+                ):
+                    raw = m.group(1)
+                    try:
+                        body = bytes(raw, "utf-8").decode("unicode_escape")
+                    except Exception:
+                        body = raw
+                    body = re.sub(r"\s+", " ", body).strip()
+                    if len(body) < 25:
+                        continue
+                    out.append({"id": None, "text": body[:480], "created_at": None, "source": "syndication"})
+                    if len(out) >= 3:
+                        break
+        except Exception as exc:
+            log.warning("syndication X failed @%s: %s", handle, exc)
+
+    # Dedupe by text prefix
+    seen: set[str] = set()
+    uniq: list[dict[str, Any]] = []
+    for tw in out:
+        key = (tw.get("text") or "")[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(tw)
+    return uniq[:5]
+
+
+async def fetch_x_tweets(client: httpx.AsyncClient, handle: str) -> list[dict[str, Any]]:
+    handle = (handle or "").lstrip("@").strip()
+    if not handle:
         return []
+    token = env_secret("X_BEARER_TOKEN", "TWITTER_BEARER_TOKEN")
+    if token:
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            user = await client.get(
+                f"https://api.x.com/2/users/by/username/{handle}",
+                headers=headers,
+                timeout=15,
+            )
+            if user.status_code < 400:
+                uid = (user.json().get("data") or {}).get("id")
+                if uid:
+                    tw = await client.get(
+                        f"https://api.x.com/2/users/{uid}/tweets",
+                        headers=headers,
+                        params={"max_results": 5, "tweet.fields": "created_at,text"},
+                        timeout=15,
+                    )
+                    if tw.status_code < 400:
+                        rows = [
+                            {
+                                "id": t.get("id"),
+                                "text": t.get("text"),
+                                "created_at": t.get("created_at"),
+                                "source": "api",
+                            }
+                            for t in (tw.json().get("data") or [])
+                        ]
+                        if rows:
+                            return rows
+        except Exception as exc:
+            log.warning("X API tweets failed @%s: %s", handle, exc)
+    # No bearer (or API failed) — public best-effort
+    return await fetch_x_tweets_public(client, handle)
 
 
 async def search_early_x(client: httpx.AsyncClient) -> list[dict[str, Any]]:
@@ -1852,10 +1950,13 @@ def report_keyboard(p: dict[str, Any]) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📩 DM Opener", callback_data=f"dm:{pid}"),
-            InlineKeyboardButton("⛓ On-chain", callback_data=f"oc:{pid}"),
+            InlineKeyboardButton("🐦 X Comment", callback_data=f"xc:{pid}"),
         ],
         [
+            InlineKeyboardButton("⛓ On-chain", callback_data=f"oc:{pid}"),
             InlineKeyboardButton("🔍 Gaps", callback_data=f"gp:{pid}"),
+        ],
+        [
             InlineKeyboardButton("⚠️ Risks", callback_data=f"rk:{pid}"),
         ],
     ]
@@ -2267,6 +2368,96 @@ async def dm_opener_text(p: dict[str, Any]) -> str:
     return "\n".join(header + body + ["", f"X: {esc(p.get('twitter') or '—')}"])
 
 
+
+async def x_post_comment_text(p: dict[str, Any], client: httpx.AsyncClient | None = None) -> str:
+    """Copyable under-post comments tied to the project's recent X posts."""
+    s = score_project(p)
+    comm = community(p)
+    kind = classify_project(p)
+    handle = x_handle(p.get("twitter") or "") or str(comm.get("x_handle") or "")
+    tweets = list(comm.get("x_tweets") or [])
+    if client and handle:
+        try:
+            fresh = await fetch_x_tweets(client, handle)
+            if fresh:
+                tweets = fresh[:5]
+        except Exception:
+            log.warning("x_post_comment tweet refresh failed", exc_info=True)
+    if not tweets:
+        return (
+            f"🐦 <b>X COMMENT</b>\n"
+            f"<b>{esc(title_of(p))}</b>\n\n"
+            "Couldn’t pull recent posts automatically (no Bearer + public fetch empty).\n\n"
+            "<b>Works without a Bearer token:</b>\n"
+            "1. Open their X → copy the post text\n"
+            "2. Tap <b>💬 Reply</b> on this alert\n"
+            "3. Paste the post → get copyable under-post replies\n\n"
+            "Or try 🔄 Refresh once, then 🐦 X Comment again."
+        )
+
+    posts = []
+    for tw in tweets[:2]:
+        text = (tw.get("text") or "").strip()
+        if not text:
+            continue
+        posts.append({"id": tw.get("id"), "text": text[:500]})
+    if not posts:
+        return (
+            f"🐦 <b>X COMMENT</b>\n"
+            f"<b>{esc(title_of(p))}</b>\n\n"
+            "Posts found but empty text — try Refresh."
+        )
+
+    facts = build_project_fact_sheet(p)
+    post_block = "\n\n".join(
+        f"POST {i}:\n{post['text']}" for i, post in enumerate(posts, 1)
+    )
+    prompt = (
+        f"{PROJECT_GROUNDING}\n\n"
+        f"PROJECT FACT SHEET (SOURCE FACTS — only these may be referenced):\n{facts}\n\n"
+        f"RECENT PROJECT X POSTS TO REPLY UNDER:\n{post_block}\n\n"
+        f"Write comments the user can paste UNDER those posts on X.\n"
+        f"For EACH post, write 3 short reply options (REPLY A / B / C).\n"
+        f"Rules:\n"
+        f"- Each reply must clearly address what THAT post actually says (not a generic project comment).\n"
+        f"- Ground any product detail only in the fact sheet.\n"
+        f"- Human, natural, X-length (under ~240 chars ideal).\n"
+        f"- No hashtags dump. No moon language. No fake 'I used the product'.\n"
+        f"- Mix angles across A/B/C: curious question, sharp observation, light supporter.\n"
+        f"Format EXACTLY:\n"
+        f"POST 1\n"
+        f"<one-line summary of the post>\n"
+        f"REPLY A\n<text>\n"
+        f"REPLY B\n<text>\n"
+        f"REPLY C\n<text>\n\n"
+        f"POST 2\n"
+        f"... (only if 2 posts provided)\n"
+        f"Variation seed {random.randint(1,9999)}."
+    )
+    generated = await llm_write(prompt)
+    header: list[str] = [
+        "🐦 <b>X COMMENT · under their posts</b>",
+        f"<b>{esc(title_of(p))}</b> · {kind['label']} · {s['band']} {s['score']}/100",
+        "",
+        "Long-press a block → copy → paste as a reply on that post.",
+        "",
+    ]
+    for i, post in enumerate(posts, 1):
+        header.append(f"<b>Post {i}</b>")
+        preview = post["text"][:180] + ("…" if len(post["text"]) > 180 else "")
+        header.append(f"<i>{esc(preview)}</i>")
+        tid = post.get("id")
+        if handle and tid:
+            header.append(f"https://x.com/{esc(handle)}/status/{esc(str(tid))}")
+        header.append("")
+    if generated:
+        body = [copyable_brief(generated)]
+    else:
+        body = ["⚠️ AI unavailable — try again in a minute."]
+    return "\n".join(header + body + ["", f"X: {esc(p.get('twitter') or '—')}"])
+
+
+
 def copyable_brief(text: str) -> str:
     """Format labeled reply options so each body is one long-press-copyable block."""
     labels = {
@@ -2276,6 +2467,9 @@ def copyable_brief(text: str) -> str:
         "OPTION7", "OPTION8",
         "OPTION 1", "OPTION 2", "OPTION 3", "OPTION 4", "OPTION 5", "OPTION 6",
         "OPTION 7", "OPTION 8",
+        "POST 1", "POST 2", "POST 3", "POST1", "POST2", "POST3",
+        "REPLY A", "REPLY B", "REPLY C", "REPLY 1", "REPLY 2", "REPLY 3",
+        "DM 1", "DM 2", "DM 3", "DM1", "DM2", "DM3",
     }
     out: list[str] = []
     buf: list[str] = []
@@ -2736,6 +2930,75 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+
+async def project_from_button(
+    q,
+    context: ContextTypes.DEFAULT_TYPE,
+    pid: int | None = None,
+) -> dict[str, Any] | None:
+    """Load project by id, or recover from the alert message text if DB was wiped/redeployed."""
+    db, client = deps(context)
+    if pid is not None:
+        row = await db.by_id(int(pid))
+        if row:
+            return row
+    # Recover from message body (survives id resets if same CA was re-scanned)
+    msg = q.message
+    blob = ""
+    if msg:
+        blob = (msg.text or "") + "\n" + (msg.caption or "")
+    if not blob:
+        return None
+    # Prefer explicit contract from Scout alerts/reports (HTML or plain text)
+    addr = None
+    for pat in (
+        r"Contract:\s*`([^`]+)`",
+        r"Contract:\s*([a-zA-Z0-9]{32,66})",
+        r"<code>([a-zA-Z0-9]{32,66})</code>",
+        r"\b(0x[a-fA-F0-9]{40})\b",
+        r"\b([1-9A-HJ-NP-Za-km-z]{32,48})\b",  # solana-ish
+    ):
+        m = re.search(pat, blob)
+        if m:
+            cand = m.group(1).strip()
+            if cand and cand not in {"—", "-", "none", "null"}:
+                addr = cand
+                break
+    if not addr:
+        return None
+    chain = None
+    cm = re.search(r"NEW PROJECT IDENTIFIED \(([A-Za-z0-9_-]+)\)", blob)
+    if not cm:
+        cm = re.search(r"SOCIAL UPDATE \(([A-Za-z0-9_-]+)\)", blob)
+    if not cm:
+        cm = re.search(r"\(([A-Za-z0-9_-]+)\)\s*$", blob.splitlines()[0] if blob else "")
+    if cm:
+        chain = cm.group(1).lower()
+    # Try DB by token
+    if chain:
+        row = await db.by_token(chain, addr)
+        if row:
+            return row
+    # Any chain match on address
+    try:
+        cur = await db.c.execute(
+            "SELECT * FROM projects WHERE lower(token_address)=lower(?) ORDER BY id DESC LIMIT 1",
+            (addr,),
+        )
+        row = await cur.fetchone()
+        if row:
+            return dict(row)
+    except Exception:
+        log.warning("address fallback query failed", exc_info=True)
+    # Live resolve from Dex
+    query = f"{chain}:{addr}" if chain else addr
+    try:
+        return await resolve_project(db, client, query, context.bot)
+    except Exception:
+        log.exception("resolve_project fallback failed")
+        return None
+
+
 async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.callback_query or not update.callback_query.data:
         return
@@ -2748,10 +3011,13 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except (IndexError, ValueError):
         await safe_cb_answer(q, "Bad button data", show_alert=True)
         return
-    db, client = deps(context)
-    project = await db.by_id(pid)
+    project = await project_from_button(q, context, pid)
     if not project:
-        await safe_cb_answer(q, "Expired — send /jobs again", show_alert=True)
+        await safe_cb_answer(
+            q,
+            "Project not in DB (redeploy wiped ids). Use /project <CA> or wait for a new alert.",
+            show_alert=True,
+        )
         return
     # Instant UI feedback so Telegram spinner stops and user sees progress
     try:
@@ -2785,8 +3051,16 @@ async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     try:
         pid = int(update.callback_query.data.split(":")[1])
+        project = await project_from_button(update.callback_query, context, pid)
+        if not project:
+            await safe_cb_answer(
+                update.callback_query,
+                "Project not in DB (old alert after redeploy). Use /project <CA> then /watch.",
+                show_alert=True,
+            )
+            return
         db, _ = deps(context)
-        await db.watch(update.effective_user.id, pid)
+        await db.watch(update.effective_user.id, int(project["id"]))
         await safe_cb_answer(update.callback_query, "Saved to /watchlist")
     except Exception:
         log.exception("cb_watch failed")
@@ -3032,10 +3306,13 @@ async def cb_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception:
         await safe_cb_answer(q, "Bad button", show_alert=True)
         return
-    db, client = deps(context)
-    project = await db.by_id(pid)
+    project = await project_from_button(q, context, pid)
     if not project:
-        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
+        await safe_cb_answer(
+            q,
+            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            show_alert=True,
+        )
         return
     await safe_cb_answer(q, "Writing…")
     try:
@@ -3059,10 +3336,13 @@ async def cb_dm_opener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception:
         await safe_cb_answer(q, "Bad button", show_alert=True)
         return
-    db, client = deps(context)
-    project = await db.by_id(pid)
+    project = await project_from_button(q, context, pid)
     if not project:
-        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
+        await safe_cb_answer(
+            q,
+            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            show_alert=True,
+        )
         return
     await safe_cb_answer(q, "Writing DM openers…")
     try:
@@ -3075,6 +3355,42 @@ async def cb_dm_opener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_fail(q, f"DM openers failed: {str(exc)[:80]}", report_keyboard(project) if project else None)
 
 
+
+
+async def cb_x_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🐦 X Comment — replies aligned to the project's recent posts."""
+    if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
+        return
+    q = update.callback_query
+    try:
+        pid = int(q.data.split(":")[1])
+    except Exception:
+        await safe_cb_answer(q, "Bad button", show_alert=True)
+        return
+    project = await project_from_button(q, context, pid)
+    if not project:
+        await safe_cb_answer(
+            q,
+            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            show_alert=True,
+        )
+        return
+    await safe_cb_answer(q, "Writing X comments…")
+    db, client = deps(context)
+    try:
+        text = await x_post_comment_text(project, client)
+        await safe_edit(q, text, report_keyboard(project))
+        if q.message:
+            remember_alert_message(
+                context.application, q.message.chat_id, q.message.message_id, project["id"]
+            )
+    except Exception as exc:
+        log.exception("cb_x_comment failed")
+        await safe_fail(
+            q, f"X comment failed: {str(exc)[:80]}", report_keyboard(project) if project else None
+        )
+
+
 async def cb_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context) or not update.callback_query or not update.callback_query.data:
         return
@@ -3084,10 +3400,13 @@ async def cb_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         await safe_cb_answer(q, "Bad button", show_alert=True)
         return
-    db, client = deps(context)
-    project = await db.by_id(pid)
+    project = await project_from_button(q, context, pid)
     if not project:
-        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
+        await safe_cb_answer(
+            q,
+            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            show_alert=True,
+        )
         return
     await safe_cb_answer(q, "Researching gaps…")
     try:
@@ -3107,10 +3426,13 @@ async def cb_risks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         await safe_cb_answer(q, "Bad button", show_alert=True)
         return
-    db, client = deps(context)
-    project = await db.by_id(pid)
+    project = await project_from_button(q, context, pid)
     if not project:
-        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
+        await safe_cb_answer(
+            q,
+            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            show_alert=True,
+        )
         return
     await safe_cb_answer(q, "Researching risks…")
     try:
@@ -3130,10 +3452,13 @@ async def cb_onchain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception:
         await safe_cb_answer(q, "Bad button", show_alert=True)
         return
-    db, client = deps(context)
-    project = await db.by_id(pid)
+    project = await project_from_button(q, context, pid)
     if not project:
-        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
+        await safe_cb_answer(
+            q,
+            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            show_alert=True,
+        )
         return
     await safe_cb_answer(q, "On-chain…")
     try:
@@ -4078,11 +4403,15 @@ async def cb_reply_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception:
         await safe_cb_answer(q, "Bad data", show_alert=True)
         return
-    db, _ = deps(context)
-    project = await db.by_id(pid)
+    project = await project_from_button(q, context, pid)
     if not project:
-        await safe_cb_answer(q, "Expired — open project again", show_alert=True)
+        await safe_cb_answer(
+            q,
+            "Project not in DB (old alert after redeploy). Use /project <CA>.",
+            show_alert=True,
+        )
         return
+    pid = int(project["id"])
     pending = context.application.bot_data.setdefault("pending_reply", {})
     pending[update.effective_user.id] = {
         "pid": pid,
@@ -4288,6 +4617,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_persona, pattern=r"^ps:"))
     app.add_handler(CallbackQueryHandler(cb_persona_select, pattern=r"^pn:"))
     app.add_handler(CallbackQueryHandler(cb_dm_opener, pattern=r"^dm:"))
+    app.add_handler(CallbackQueryHandler(cb_x_comment, pattern=r"^xc:"))
     app.add_handler(CallbackQueryHandler(cb_onchain, pattern=r"^oc:"))
     app.add_handler(CallbackQueryHandler(cb_gaps, pattern=r"^gp:"))
     app.add_handler(CallbackQueryHandler(cb_risks, pattern=r"^rk:"))
