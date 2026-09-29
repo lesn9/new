@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-29-scout-x-no-bearer"
+SCOUT_BUILD = "2026-09-29-scout-refresh-db-fix"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -3029,6 +3029,7 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     except Exception:
         pass
+    db, client = deps(context)
     try:
         project = await enrich_one(db, client, project, context.bot, force=True)
         await safe_edit(q, report_text(project), report_keyboard(project))
