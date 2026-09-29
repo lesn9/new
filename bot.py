@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-27-scout-reply-button"
+SCOUT_BUILD = "2026-09-29-scout-grounded-personas"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -2016,6 +2016,103 @@ def onchain_text(p: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
+def build_project_fact_sheet(p: dict[str, Any]) -> str:
+    """Internal SOURCE FACTS only — every persona/DM line must trace back to these."""
+    comm = community(p)
+    kind = classify_project(p)
+    lines: list[str] = [
+        f"NAME: {title_of(p)}",
+        f"CHAIN: {p.get('chain') or 'unknown'}",
+        f"TYPE_LABEL: {kind.get('label') if isinstance(kind, dict) else kind}",
+        f"CONTRACT: {p.get('token_address') or 'not listed'}",
+        f"WEBSITE: {p.get('website') or 'none'}",
+        f"X: {p.get('twitter') or 'none'}",
+        f"TELEGRAM: {p.get('telegram') or 'none'}",
+        f"DISCORD: {p.get('discord') or 'none'}",
+        f"DOCS: {p.get('docs') or 'none'}",
+    ]
+    desc = (p.get("description") or "").strip()
+    site_about = str(comm.get("site_about") or "").strip()
+    tg_about = str(comm.get("tg_about") or "").strip()
+    if desc:
+        lines.append(f"PROJECT_DESCRIPTION: {desc[:900]}")
+    if site_about and site_about != desc:
+        lines.append(f"SITE_ABOUT: {site_about[:900]}")
+    if tg_about:
+        lines.append(f"TG_ABOUT: {tg_about[:400]}")
+    for key in ("site_title", "site_h1", "site_headlines", "site_ctas"):
+        val = comm.get(key)
+        if val:
+            lines.append(f"{key.upper()}: {str(val)[:500]}")
+    tweets = comm.get("x_tweets") or []
+    if tweets:
+        lines.append("RECENT_X_POSTS:")
+        for tw in tweets[:5]:
+            tx = (tw.get("text") or "").strip()
+            if tx:
+                lines.append(f"  - {tx[:220]}")
+    else:
+        lines.append("RECENT_X_POSTS: none indexed")
+    for label, key in (
+        ("LIQUIDITY_USD", "liquidity_usd"),
+        ("MCAP_USD", "market_cap"),
+        ("FDV_USD", "fdv"),
+        ("VOLUME_24H", "volume_24h"),
+        ("HOLDERS", "holders"),
+        ("LAUNCHED_AT_UNIX", "launched_at"),
+        ("DISCOVERED_AT_UNIX", "discovered_at"),
+        ("SOURCE", "source"),
+    ):
+        if p.get(key) not in (None, "", 0):
+            lines.append(f"{label}: {p.get(key)}")
+    missing = []
+    if not p.get("website"):
+        missing.append("no official website link stored")
+    if not p.get("twitter"):
+        missing.append("no X link stored")
+    if not p.get("telegram"):
+        missing.append("no Telegram link stored")
+    if not desc and not site_about:
+        missing.append("no project description / site about text")
+    if not tweets:
+        missing.append("no recent X posts indexed")
+    if missing:
+        lines.append("DATA_GAPS: " + "; ".join(missing))
+    lines.append(
+        "STATUS_NOTE: Only treat items above as documented. "
+        "Anything not listed (staking, oracles, bridges owned by project, audits, "
+        "governance, testnet, privacy crypto, ENS, LP incentives, partnerships) "
+        "is NOT documented — do not assume it exists."
+    )
+    return "\n".join(lines)
+
+
+PROJECT_GROUNDING = """
+CORE RULE: PROJECT-GROUNDED GENERATION.
+Every line must be something a person who studied THIS project could naturally say.
+
+SOURCE OF TRUTH = PROJECT FACT SHEET below only (site/docs/description/X posts we actually have).
+Never invent: liquidity pools, LP incentives, oracles, testnets, staking, governance,
+token utility, ENS, privacy crypto, bridges owned by the project, audits, partnerships,
+custodial infra, or personal usage ("I swapped", "I tried the app") unless the fact sheet states it.
+
+DOCUMENTED vs INFERRED vs UNSUPPORTED:
+- Only use EXPLICITLY DOCUMENTED or STRONGLY SUPPORTED facts from the fact sheet.
+- Questions need a verified premise: "According to the project I know X; unclear is Y."
+- Do NOT ask questions whose answers are already explicit in the fact sheet.
+- Do NOT substitute generic DeFi architecture for this project's actual setup.
+- Respect status: live vs planned vs not documented.
+- Personas change STYLE only — never the facts.
+- Suggestions: only if a real gap is visible in the fact sheet (documented feature → friction → specific suggestion).
+- If the fact sheet is thin, say so honestly and ask open questions about what is missing — do not invent depth.
+
+FINAL CHECK before each line:
+Could the project team read this and say "yes, that's actually about our product"?
+If not, discard and rewrite from the fact sheet.
+"""
+
+
 async def classic_persona_text(p: dict[str, Any]) -> str:
     """PERSONA button — old style: replies to an implied question/context.
     Labels: CURIOUS, INVESTOR, SUGGESTION, QUESTION, SUPPORTER, STRATEGIST, RANDOM, DEGEN
@@ -2030,14 +2127,18 @@ async def classic_persona_text(p: dict[str, Any]) -> str:
     door = "X only" if has_x and not has_tg else ("Telegram + X" if has_tg and has_x else ("Telegram" if has_tg else "thin socials"))
     kind = classify_project(p)
 
+    facts = build_project_fact_sheet(p)
     prompt = (
-        f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
-        f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTelegram: {p.get('telegram')}\n"
-        f"About: {what}\nRecent X:\n{tweet_blob}\nDoor: {door}\n\n"
-        f"Write short human messages as if replying to an invisible community context / implied question.\n"
-        f"Use these labels exactly, each 1-2 sentences, specific to THIS product:\n"
+        f"{PROJECT_GROUNDING}\n\n"
+        f"PROJECT FACT SHEET (SOURCE FACTS — only these may be referenced):\n{facts}\n\n"
+        f"Door/socials note: {door}\n\n"
+        f"Write short human messages as if reacting in community context / implied discussion.\n"
+        f"Each message MUST rest on at least one fact from the fact sheet.\n"
+        f"If a label needs a question, the premise must be documented; ask only about a real gap.\n"
+        f"Personas change voice only. No invented features. No fake personal usage.\n"
+        f"Labels exactly (1-2 sentences each, copy-paste ready):\n"
         f"CURIOUS\nINVESTOR\nSUGGESTION\nQUESTION\nSUPPORTER\nSTRATEGIST\nRANDOM\nDEGEN\n"
-        f"Sound like a real person. No AI meta. No hashtags dump. Variation seed {random.randint(1,9999)}."
+        f"No AI meta. No hashtag dumps. Variation seed {random.randint(1,9999)}."
     )
     generated = await llm_write(prompt)
     header = [
@@ -2086,14 +2187,18 @@ async def approach_persona_text(p: dict[str, Any], persona_key: str = "curious")
     persona = PERSONAS.get(persona_key, PERSONAS["curious"])
     kind = classify_project(p)
 
+    facts = build_project_fact_sheet(p)
     prompt = (
-        f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
-        f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTelegram: {p.get('telegram')}\n"
-        f"About: {what}\nRecent X:\n{tweet_blob}\nDoor: {door}\n\n"
-        f"PERSONA TO ADOPT (strict):\n{persona['label']}: {persona['desc']}\n\n"
-        f"Write 4-5 short, ready-to-post messages this persona would actually send.\n"
-        f"Sound 100% human. No AI cadence. Each message stands alone for X or TG.\n"
-        f"No hashtags dump. Variation seed {random.randint(1,9999)}.\n"
+        f"{PROJECT_GROUNDING}\n\n"
+        f"PROJECT FACT SHEET (SOURCE FACTS — only these may be referenced):\n{facts}\n\n"
+        f"Door/socials note: {door}\n\n"
+        f"PERSONA TO ADOPT (style only — facts stay fixed):\n{persona['label']}: {persona['desc']}\n\n"
+        f"Write 4-5 short ready-to-post messages this persona would send about THIS project.\n"
+        f"Each option must rest on a specific fact from the fact sheet.\n"
+        f"No invented features, no fake 'I used the app', no generic DeFi questions.\n"
+        f"If facts are thin, acknowledge thin public detail and ask open, honest questions.\n"
+        f"Sound 100% human. Each message stands alone for X or TG.\n"
+        f"No hashtag dumps. Variation seed {random.randint(1,9999)}.\n"
         f"Format:\nOPTION 1\n<option text>\nOPTION 2\n<option text>\n..."
     )
     generated = await llm_write(prompt)
@@ -2129,16 +2234,18 @@ async def dm_opener_text(p: dict[str, Any]) -> str:
     tweets = comm.get("x_tweets") or []
     tweet_blob = "\n".join(f"- {(t.get('text') or '')[:160]}" for t in tweets[:3]) or "No recent tweets."
 
+    facts = build_project_fact_sheet(p)
     prompt = (
-        f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
-        f"Website: {p.get('website')}\nX: {p.get('twitter')}\n"
-        f"About: {what}\nRecent X:\n{tweet_blob}\n\n"
-        f"Write 3 X DM / reply openers that sound like a real person doing due diligence.\n"
-        f"Goals:\n"
-        f"- Show genuine interest or that you've used / seriously reviewed the product\n"
-        f"- Ask 1 sharp question that only someone who looked would ask\n"
-        f"- Make it natural for the team to reply or say 'DM me' / accept a DM\n"
-        f"- Not salesy. Not 'to the moon'. Not AI-sounding.\n"
+        f"{PROJECT_GROUNDING}\n\n"
+        f"PROJECT FACT SHEET (SOURCE FACTS — only these may be referenced):\n{facts}\n\n"
+        f"Write 3 X DM / reply openers a real person would send after studying this project.\n"
+        f"Each DM MUST include:\n"
+        f"1) One specific observation from the fact sheet (not generic praise)\n"
+        f"2) One genuine unresolved implication/question the fact sheet does not already answer\n"
+        f"3) Natural conversational wording\n"
+        f"Do NOT claim you used the product/testnet unless the fact sheet supports that.\n"
+        f"Prefer: 'I was looking through…' / 'I noticed from the site…' when true.\n"
+        f"Not salesy. Not moon language. Not AI-sounding.\n"
         f"Format:\nDM 1\n<text>\nDM 2\n<text>\nDM 3\n<text>\n"
         f"Variation seed {random.randint(1,9999)}."
     )
@@ -3657,13 +3764,14 @@ async def ask_personas_text(p: dict[str, Any], question: str) -> str:
     comm = community(p)
     what = p.get("description") or comm.get("site_about") or comm.get("tg_about") or "Thin public description."
     kind = classify_project(p)
+    facts = build_project_fact_sheet(p)
     prompt = (
-        f"Project: {title_of(p)}\nChain: {p.get('chain')}\nType: {kind['label']}\n"
-        f"Website: {p.get('website')}\nX: {p.get('twitter')}\nTelegram: {p.get('telegram')}\n"
-        f"About: {what}\n"
-        f"Community question:\n{question}\n\n"
+        f"{PROJECT_GROUNDING}\n\n"
+        f"PROJECT FACT SHEET (SOURCE FACTS — only these may be referenced):\n{facts}\n\n"
+        f"Community / user question to respond to:\n{question}\n\n"
         f"Write 4-5 ready-to-post reply options in different human voices "
-        f"(curious, investor, holder, strategist). "
+        f"(curious, investor, holder, strategist).\n"
+        f"Ground every reply in the fact sheet. Do not invent product details.\n"
         f"Sound real. No AI meta. Variation seed {random.randint(1,9999)}.\n"
         f"Format:\nOPTION 1\n<text>\nOPTION 2\n<text>..."
     )
@@ -3977,28 +4085,25 @@ async def on_reply_to_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             or (comm.get("site_about") if isinstance(comm, dict) else None)
             or "Thin public description."
         )
+        facts = build_project_fact_sheet(project)
         prompt = (
-            f"Project: {title_of(project)}\n"
-            f"Chain: {project.get('chain')}\n"
-            f"Type: {kind_label}\n"
-            f"Website: {project.get('website')}\n"
-            f"X: {project.get('twitter')}\n"
-            f"Telegram: {project.get('telegram')}\n"
-            f"About: {what}\n\n"
+            f"{PROJECT_GROUNDING}\n\n"
+            f"PROJECT FACT SHEET (SOURCE FACTS — only these may be referenced):\n{facts}\n\n"
             f"USER PASTED THIS (X post / message / note). Write replies TO IT:\n"
             f"{text_in[:1500]}\n\n"
-            f"Write EXACTLY these 8 reply options. Each body must be ready to copy-paste as-is.\n"
+            f"Write EXACTLY these 8 reply options. Each body ready to copy-paste.\n"
+            f"Ground every reply in the fact sheet + the pasted text. No invented project features.\n"
             f"Different content each time — not the same idea reworded.\n"
             f"No AI meta. No investment advice. Short human crypto replies.\n"
             f"Rules per label:\n"
             f"- CASUAL: relaxed natural reply\n"
             f"- SUPPORTER: constructive support without sounding like a shill\n"
-            f"- QUESTION: address them first, then ask one clear question\n"
-            f"- CURIOUS: address them first, then a genuine curious question\n"
-            f"- INVESTOR: confident, thesis-minded, still human\n"
+            f"- QUESTION: address them first, then ask one clear question with a verified premise\n"
+            f"- CURIOUS: address them first, then a genuine curious question from a real gap\n"
+            f"- INVESTOR: confident, thesis-minded, still human — only on documented angles\n"
             f"- ENGAGER: invites more conversation\n"
-            f"- STRATEGIST: sharp observation / growth angle\n"
-            f"- SUGGESTION: one concrete useful suggestion\n\n"
+            f"- STRATEGIST: sharp observation tied to a fact-sheet detail\n"
+            f"- SUGGESTION: one concrete suggestion only if a real gap is visible\n\n"
             f"Format EXACTLY (labels on their own line):\n"
             f"CASUAL\n<reply>\n\n"
             f"SUPPORTER\n<reply>\n\n"
