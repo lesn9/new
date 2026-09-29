@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-29-scout-ca-lock"
+SCOUT_BUILD = "2026-09-29-scout-buttons-stable"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -2936,7 +2936,6 @@ async def _extract_ca_chain_from_message(blob: str) -> tuple[str | None, str | N
     if not blob:
         return None, None
     addr = None
-    # Only explicit contract lines / code tags — never loose base58 (false matches)
     for pat in (
         r"Contract:\s*`([^`]+)`",
         r"Contract:\s*([a-zA-Z0-9]{32,66})",
@@ -2947,7 +2946,7 @@ async def _extract_ca_chain_from_message(blob: str) -> tuple[str | None, str | N
     ):
         m = re.search(pat, blob, flags=re.I)
         if m:
-            cand = m.group(1).strip()
+            cand = (m.group(1) or "").strip()
             if cand and cand not in {"—", "-", "none", "null"}:
                 addr = cand
                 break
@@ -2955,7 +2954,6 @@ async def _extract_ca_chain_from_message(blob: str) -> tuple[str | None, str | N
     for pat in (
         r"NEW PROJECT IDENTIFIED \(([A-Za-z0-9_-]+)\)",
         r"SOCIAL UPDATE \(([A-Za-z0-9_-]+)\)",
-        r"🚨[^\n]*\(([A-Za-z0-9_-]+)\)",
     ):
         cm = re.search(pat, blob, flags=re.I)
         if cm:
@@ -2969,51 +2967,39 @@ async def project_from_button(
     context: ContextTypes.DEFAULT_TYPE,
     pid: int | None = None,
 ) -> dict[str, Any] | None:
-    """Load the project for a button press.
+    """Resolve project for a button. Prefer DB id; recover via message CA only if id missing."""
+    try:
+        db, client = deps(context)
+    except Exception:
+        log.exception("project_from_button: deps failed")
+        return None
 
-    CRITICAL: After DB wipe/redeploy, numeric ids get reused for different CAs.
-    Always prefer the contract shown on the message over a recycled id.
-    """
-    db, client = deps(context)
-    msg = q.message
-    blob = ""
-    if msg:
-        blob = (msg.text or "") + "\n" + (msg.caption or "")
-    msg_addr, msg_chain = _extract_ca_chain_from_message(blob)
-
-    row = None
+    # 1) Primary: numeric id on the button (normal path)
     if pid is not None:
         try:
             row = await db.by_id(int(pid))
+            if row:
+                return row
         except Exception:
-            row = None
+            log.exception("project_from_button: by_id failed")
 
-    # If message has a CA and by_id row disagrees → message wins (recycled id case)
-    if row and msg_addr:
-        row_addr = (row.get("token_address") or "").strip()
-        if row_addr and row_addr.lower() != msg_addr.lower():
-            log.warning(
-                "button id=%s points to %s but message CA is %s — using message CA",
-                pid, row_addr, msg_addr,
-            )
-            row = None
-        elif msg_chain and (row.get("chain") or "").lower() not in {msg_chain, msg_chain.replace("_", "")}:
-            # soft: chain labels sometimes differ (base vs base-mainnet) — only drop on clear CA mismatch
-            pass
-
-    if row:
-        return row
-
-    # Recover by contract on the message
+    # 2) Recovery: contract printed on the alert (after DB wipe / missing id)
+    blob = ""
+    try:
+        msg = q.message
+        if msg:
+            blob = (msg.text or "") + "\n" + (msg.caption or "")
+    except Exception:
+        blob = ""
+    msg_addr, msg_chain = _extract_ca_chain_from_message(blob)
     if not msg_addr:
         return None
 
-    if msg_chain:
-        found = await db.by_token(msg_chain, msg_addr)
-        if found:
-            return found
-
     try:
+        if msg_chain:
+            found = await db.by_token(msg_chain, msg_addr)
+            if found:
+                return found
         cur = await db.c.execute(
             "SELECT * FROM projects WHERE lower(token_address)=lower(?) ORDER BY id DESC LIMIT 1",
             (msg_addr,),
@@ -3022,14 +3008,14 @@ async def project_from_button(
         if found:
             return dict(found)
     except Exception:
-        log.warning("address fallback query failed", exc_info=True)
+        log.exception("project_from_button: CA lookup failed")
 
-    # Live resolve ONLY with explicit chain:addr (never bare search — that swaps projects)
+    # 3) Last resort: live resolve with chain:addr only
     if msg_chain:
         try:
             return await resolve_project(db, client, f"{msg_chain}:{msg_addr}", context.bot)
         except Exception:
-            log.exception("resolve_project fallback failed")
+            log.exception("project_from_button: resolve failed")
     return None
 
 
@@ -3039,7 +3025,6 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await gate(update, context):
         return
     q = update.callback_query
-    await safe_cb_answer(q, "Refreshing…")
     try:
         pid = int(q.data.split(":")[1])
     except (IndexError, ValueError):
@@ -3049,11 +3034,11 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not project:
         await safe_cb_answer(
             q,
-            "Project not in DB (redeploy wiped ids). Use /project <CA> or wait for a new alert.",
+            "Project not in DB. Use /project <CA> or wait for a new alert.",
             show_alert=True,
         )
         return
-    # Instant UI feedback so Telegram spinner stops and user sees progress
+    await safe_cb_answer(q, "Refreshing…")
     try:
         await q.edit_message_text(
             f"⏳ Refreshing <b>{esc(title_of(project))}</b>…",
@@ -3063,20 +3048,21 @@ async def cb_investigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     except Exception:
         pass
-    db, client = deps(context)
     try:
+        db, client = deps(context)
         project = await enrich_one(db, client, project, context.bot, force=True)
         await safe_edit(q, report_text(project), report_keyboard(project))
         if q.message:
             remember_alert_message(
-                context.application, q.message.chat_id, q.message.message_id, project["id"]
+                context.application, q.message.chat_id, q.message.message_id, int(project["id"])
             )
     except Exception as exc:
         log.exception("cb_investigate failed")
-        try:
-            await safe_edit(q, f"⚠️ Refresh failed: {esc(str(exc)[:120])}\nTap 🔄 Refresh to retry.", report_keyboard(project))
-        except Exception:
-            pass
+        await safe_fail(
+            q,
+            f"Refresh failed: {str(exc)[:100]}",
+            report_keyboard(project) if project else None,
+        )
 
 
 async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
