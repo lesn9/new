@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
 CREATE INDEX IF NOT EXISTS idx_proj_disc ON projects(discovered_at DESC);
 """
 
-SCOUT_BUILD = "2026-09-29-scout-durable-cb"
+SCOUT_BUILD = "2026-09-30-scout-no-swap"
 
 HELP = """🔎 <b>Web3 Project Scout</b>
 
@@ -1960,50 +1960,114 @@ def cb_data_persona(p: dict[str, Any], persona_key: str) -> str:
     return f"pn:{p['id']}:{key}"
 
 
+async def _lookup_project_by_ca(
+    db: "DB",
+    client: httpx.AsyncClient,
+    chain: str | None,
+    addr: str,
+    bot=None,
+) -> dict[str, Any] | None:
+    """Resolve a project strictly by contract address (optional chain hint)."""
+    addr = (addr or "").strip()
+    if not addr:
+        return None
+    try:
+        if chain:
+            found = await db.by_token(chain.lower(), addr)
+            if found:
+                return found
+        cur = await db.c.execute(
+            "SELECT * FROM projects WHERE lower(token_address)=lower(?) ORDER BY id DESC LIMIT 5",
+            (addr,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        if chain:
+            chain_l = chain.lower()
+            for r in rows:
+                if (r.get("chain") or "").lower() == chain_l:
+                    return r
+        if rows:
+            return rows[0]
+        if chain:
+            return await resolve_project(db, client, f"{chain}:{addr}", bot)
+        # Avoid bare-address dex search (can return unrelated hits)
+        if addr.startswith("0x") and len(addr) == 42:
+            return await resolve_project(db, client, f"ethereum:{addr}", bot)
+    except Exception:
+        log.exception("_lookup_project_by_ca failed")
+    return None
+
+
 async def resolve_from_cb_parts(
     context: ContextTypes.DEFAULT_TYPE,
     q,
     parts: list[str],
 ) -> dict[str, Any] | None:
-    """Parse inv:id | inv:chain:addr → project row."""
+    """Resolve the project for a button press.
+
+    Priority (fixes recycled DB ids swapping projects):
+      1. Contract line on the *current message* (ground truth for alerts/reports)
+      2. chain:addr embedded in callback_data
+      3. numeric id — only if it matches the message contract when one is present
+    """
     try:
         db, client = deps(context)
     except Exception:
         log.exception("resolve_from_cb_parts: deps")
         return None
+
+    blob = ""
+    try:
+        if q is not None and getattr(q, "message", None) is not None:
+            blob = (q.message.text or "") + "\n" + (q.message.caption or "")
+    except Exception:
+        blob = ""
+
+    msg_addr, msg_chain = _extract_ca_chain_from_message(blob)
+
+    # 1) Message contract wins — prevents id=42 pointing at a different CA after DB reset
+    if msg_addr:
+        proj = await _lookup_project_by_ca(db, client, msg_chain, msg_addr, context.bot)
+        if proj:
+            return proj
+
     if not parts:
         return None
     rest = parts[1:]
     if not rest:
         return None
 
-    # chain:addr (chain not a pure number)
+    # 2) Durable callback: prefix:chain:addr
     if len(rest) >= 2 and not rest[0].isdigit():
         chain, addr = rest[0].lower(), rest[1]
-        try:
-            found = await db.by_token(chain, addr)
-            if found:
-                return found
-            cur = await db.c.execute(
-                "SELECT * FROM projects WHERE lower(token_address)=lower(?) ORDER BY id DESC LIMIT 1",
-                (addr,),
+        if msg_addr and addr.lower() != msg_addr.lower():
+            log.warning(
+                "callback CA %s disagrees with message CA %s — refusing swap",
+                addr, msg_addr,
             )
-            row = await cur.fetchone()
-            if row:
-                return dict(row)
-            return await resolve_project(db, client, f"{chain}:{addr}", context.bot)
-        except Exception:
-            log.exception("resolve_from_cb_parts chain:addr")
             return None
+        return await _lookup_project_by_ca(db, client, chain, addr, context.bot)
 
+    # 3) Legacy numeric id
     if rest[0].isdigit():
+        pid = int(rest[0])
         try:
-            row = await db.by_id(int(rest[0]))
-            if row:
-                return row
+            row = await db.by_id(pid)
         except Exception:
             log.exception("resolve_from_cb_parts by_id")
-        return await project_from_button(q, context, int(rest[0]))
+            row = None
+        if row and msg_addr:
+            row_addr = (row.get("token_address") or "").strip()
+            if row_addr and row_addr.lower() != msg_addr.lower():
+                log.warning(
+                    "recycled id %s is %s but message is %s — not using id",
+                    pid, row_addr, msg_addr,
+                )
+                return None
+        if row:
+            return row
+        # id missing: try message recovery helper
+        return await project_from_button(q, context, pid)
 
     return None
 
@@ -3011,29 +3075,38 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 
-async def _extract_ca_chain_from_message(blob: str) -> tuple[str | None, str | None]:
-    """Pull contract + chain from a Scout alert/report message body."""
+def _extract_ca_chain_from_message(blob: str) -> tuple[str | None, str | None]:
+    """Pull contract + chain from a Scout alert/report message body.
+
+    Only trusts explicit Contract: lines / code-tagged addresses so we do not
+    pick up unrelated hex from the message.
+    """
     if not blob:
         return None, None
     addr = None
+    # Prefer a clear Contract: line (works for HTML-stripped Telegram text too)
     for pat in (
         r"Contract:\s*`([^`]+)`",
-        r"Contract:\s*([a-zA-Z0-9]{32,66})",
         r"Contract:\s*<code>([^<]+)</code>",
-        r"<code>(0x[a-fA-F0-9]{40})</code>",
-        r"<code>([1-9A-HJ-NP-Za-km-z]{32,48})</code>",
-        r"\b(0x[a-fA-F0-9]{40})\b",
+        r"Contract:\s*([a-zA-Z0-9]{32,66})",
+        r"Contract:\s*([a-zA-Z0-9]{32,66})",
     ):
         m = re.search(pat, blob, flags=re.I)
         if m:
-            cand = (m.group(1) or "").strip()
+            cand = (m.group(1) or "").strip().rstrip(").,;")
             if cand and cand not in {"—", "-", "none", "null"}:
                 addr = cand
                 break
+    # Report header sometimes has only a code-tagged CA under Contract
+    if not addr:
+        m = re.search(r"Contract:[^\n]*\n\s*`?([a-zA-Z0-9]{32,66})`?", blob, flags=re.I)
+        if m:
+            addr = m.group(1).strip()
     chain = None
     for pat in (
         r"NEW PROJECT IDENTIFIED \(([A-Za-z0-9_-]+)\)",
         r"SOCIAL UPDATE \(([A-Za-z0-9_-]+)\)",
+        r"\(([A-Za-z0-9_-]+)\)\s*\n",  # first parenthetical chain tag near top
     ):
         cm = re.search(pat, blob, flags=re.I)
         if cm:
